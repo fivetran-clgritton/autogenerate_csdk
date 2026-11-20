@@ -21,13 +21,28 @@ if ! command -v java &>/dev/null; then
     apt-get install -y --no-install-recommends default-jre-headless
 fi
 
+# Extract Mimer native client lib from the container so mimerpy can load it
+MIMER_LIB=/usr/local/lib/libmimerapi.so
+if [ ! -f "$MIMER_LIB" ]; then
+    echo "Extracting Mimer native lib from container..."
+    MIMER_CTR=$(docker ps --filter name=mimer --format '{{.ID}}' | head -1)
+    if [ -n "$MIMER_CTR" ]; then
+        docker cp "$MIMER_CTR":/usr/lib/libmimerapi.so "$MIMER_LIB" 2>/dev/null || \
+        docker cp "$MIMER_CTR":/usr/local/lib/libmimerapi.so "$MIMER_LIB" 2>/dev/null || \
+        echo "WARNING: could not find libmimerapi.so inside the Mimer container — Mimer seeding will fail"
+        ldconfig 2>/dev/null || true
+    else
+        echo "WARNING: Mimer container not running — skipping lib extraction"
+    fi
+fi
+
 # Install missing Python packages
 source /opt/sdk-test-dbs/venv/bin/activate
 pip install --quiet CUBRIDdb mimerpy 2>&1 | tail -5
 
-# Ensure Exasol is up (idempotent)
-docker compose -f /opt/sdk-test-dbs/docker-compose.yml up -d exasol 2>&1 | grep -v "already allocated" || true
-echo "Waiting 30s for Exasol to initialize..."
+# Ensure Exasol and Geode are up (Geode needs REST API flags from updated compose)
+docker compose -f /opt/sdk-test-dbs/docker-compose.yml up -d exasol geode 2>&1 | grep -v "already allocated" || true
+echo "Waiting 30s for containers to initialize..."
 sleep 30
 
 # Reset IRIS _SYSTEM password so programmatic login works

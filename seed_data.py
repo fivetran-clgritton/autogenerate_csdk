@@ -186,7 +186,7 @@ def seed_h2(host):
         urllib.request.urlretrieve(
             "https://repo1.maven.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.jar", jar)
     conn = jaydebeapi.connect("org.h2.Driver",
-                              f"jdbc:h2:tcp://{host}:9092/~/test",
+                              f"jdbc:h2:tcp://{host}:9092//opt/h2-data/test",
                               ["sa", ""], jar)
     cur = conn.cursor()
     cur.execute("""
@@ -211,7 +211,7 @@ def seed_h2(host):
 # ── CUBRID ──────────────────────────────────────────────────────────────────────
 def seed_cubrid(host, password):
     import CUBRIDdb
-    conn = CUBRIDdb.connect(f"CUBRID:{host}:33000:testdb:::{{}}", "dba", password)
+    conn = CUBRIDdb.connect(f"CUBRID:{host}:33000:testdb:::", "dba", password)
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (

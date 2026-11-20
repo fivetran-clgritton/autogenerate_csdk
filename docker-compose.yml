@@ -73,7 +73,7 @@ services:
         gfsh start locator --name=locator1 --port=10334 --bind-address=0.0.0.0 --dir=/data/locator &&
         sleep 10 &&
         gfsh -e 'connect --locator=localhost[10334]'
-             -e 'start server --name=server1 --server-port=40404 --bind-address=0.0.0.0 --dir=/data/server' &&
+             -e 'start server --name=server1 --server-port=40404 --bind-address=0.0.0.0 --dir=/data/server --J=-Dgemfire.start-dev-rest-api=true --J=-Dgemfire.dev-rest-api-port=7070 --J=-Dgemfire.dev-rest-api-bind-address=0.0.0.0' &&
         tail -f /data/locator/locator1.log
       "
     restart: unless-stopped
