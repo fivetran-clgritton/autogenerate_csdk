@@ -48,9 +48,7 @@ sleep 30
 # Reset IRIS _SYSTEM password so programmatic login works
 # IRIS Community requires password change on first use; force it via irisdb exec
 echo "Resetting IRIS _SYSTEM password..."
-docker exec iris iris session IRIS -U '%SYS' \
-  '##class(Security.Users).ChangePassword("_SYSTEM","SYS","SYS")' 2>/dev/null || \
-  echo "IRIS password reset skipped (may already be set)"
+echo "IRIS password already changed via portal — skipping reset"
 
 FAILED=()
 
@@ -68,7 +66,7 @@ seed_db() {
 }
 
 seed_db "Exasol"  --db exasol  --host localhost --password exasol
-seed_db "IRIS"    --db iris    --host localhost --password SYS
+seed_db "IRIS"    --db iris    --host localhost --password I1DzGh0z0@YoJw
 seed_db "CUBRID"  --db cubrid  --host localhost --password TapSnlMKuWhuiGirAWlTCquZ
 seed_db "Mimer"   --db mimer   --host localhost --password cHGH1buf8XGnLS5CeuI8xjZ
 seed_db "Geode"   --db geode   --host localhost

@@ -37,7 +37,7 @@ Note: `CLOUDSDK_AUTH_ACCESS_TOKEN` is set to `proxy-injected` by the environment
 | Vertica | `ISn7D4o7psvJJ9WAxqPIm8H` |
 | CUBRID | `TapSnlMKuWhuiGirAWlTCquZ` |
 | Mimer | `cHGH1buf8XGnLS5CeuI8xjZ` |
-| IRIS | `SYS` (default `_SYSTEM`/`SYS`) |
+| IRIS | `I1DzGh0z0@YoJw` |
 | H2 | no password (`sa`/``) |
 
 ## Running Databases (Docker Compose on VM)
