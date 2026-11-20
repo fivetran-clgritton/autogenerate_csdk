@@ -1,0 +1,5 @@
+{
+  "access_id": "YOUR_MOZ_ACCESS_ID",
+  "secret_key": "YOUR_MOZ_SECRET_KEY",
+  "targets": "example.com,example2.com"
+}
