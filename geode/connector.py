@@ -5,7 +5,7 @@ from fivetran_connector_sdk import Connector, Operations as op, Logging as log
 
 
 def _base(cfg):
-    return f"http://{cfg['host']}:{cfg.get('rest_port', '7070')}/geode/v1"
+    return f"http://{cfg['host']}:{cfg.get('rest_port', '8081')}/geode/v1"
 
 
 def _regions(cfg):

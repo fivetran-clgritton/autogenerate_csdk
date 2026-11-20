@@ -3,6 +3,27 @@
 ## What this is
 Building Fivetran Connector SDK connectors for legacy databases that have no managed Fivetran connector and are not in `fivetran/community_connectors`. Priority ordered by Gong call demand + build feasibility.
 
+## Where to run Claude Code
+
+- **Anything that touches the databases** (seeding, `fivetran debug`, test scenarios, container logs): run Claude Code **on the VM**, inside tmux so a dropped SSH doesn't kill long jobs:
+  ```bash
+  tmux new -s claude        # reattach later with: tmux attach -t claude
+  cd /opt/sdk-test-dbs/connectors
+  claude
+  ```
+- **Claude Code cloud sessions** can edit code, change GCP firewall rules (via `GCLOUD_SERVICE_ACCOUNT_KEY`) and query BigQuery, but cannot SSH to the VM (IAP tunnel blocked by the egress proxy) or reach any DB port.
+- The VM checkout needs GitHub push credentials (e.g. `gh auth login` or a PAT) before a VM session can commit fixes; `seed_all.sh` resets the checkout to `origin/main` on every run.
+
+## VM layout
+
+| Path | What |
+|------|------|
+| `/opt/sdk-test-dbs/connectors` | Clone of this repo (`fivetran-clgritton/autogenerate_csdk`, **public**) |
+| `/opt/sdk-test-dbs/docker-compose.yml` | The compose file the running containers come from. It is a **separate copy**, not this repo's `docker-compose.yml` (container names differ, e.g. `exasol` vs `connectors-exasol-1`). Port or flag changes made in the repo copy must be applied here by hand. Never run `docker compose` from the repo directory — it creates a second project with blank passwords. |
+| `/opt/sdk-test-dbs/.env` | `VERTICA_PASS`, `CUBRID_PASS`, `MIMER_PASS` used by compose |
+| `/opt/sdk-test-dbs/venv` | Python 3.14 venv (3.14 built from source; Debian only ships 3.11) |
+| `/mnt/data/<service>` | Container data (500GB SSD) |
+
 ## GCP Test Infrastructure
 
 | Item | Value |
@@ -13,23 +34,24 @@ Building Fivetran Connector SDK connectors for legacy databases that have no man
 | Project | `internal-sales` |
 | Machine | `n2-standard-8` (8 vCPU, 32GB RAM) |
 | Data disk | `sdk-test-data` — 500GB SSD at `/mnt/data` |
-| Compose dir | `/opt/sdk-test-dbs/` on the VM |
+| Firewall | `sdk-test-db-ports` (DB ports + 8563 + 52773, allowlisted source IPs only), `sdk-test-ssh` (22) |
 
-SSH into the VM:
+SSH from a laptop:
 ```bash
-unset CLOUDSDK_AUTH_ACCESS_TOKEN
+gcloud compute ssh sdk-test-dbs --zone=us-central1-a --project=internal-sales --tunnel-through-iap
+```
+
+gcloud from a cloud session (API calls only, e.g. firewall rules — no SSH):
+```bash
+unset CLOUDSDK_AUTH_ACCESS_TOKEN   # set to `proxy-injected` by the environment
 echo "${GCLOUD_SERVICE_ACCOUNT_KEY}" > /tmp/sa-key.json
 gcloud auth activate-service-account --key-file=/tmp/sa-key.json
 gcloud config set project internal-sales
-gcloud compute ssh sdk-test-dbs --zone=us-central1-a --project=internal-sales --tunnel-through-iap --command="<cmd>"
 ```
 
-Note: `CLOUDSDK_AUTH_ACCESS_TOKEN` is set to `proxy-injected` by the environment — always `unset` it before running gcloud commands.
-
-**IMPORTANT — IAP tunnel is blocked from Claude Code cloud sessions:**
-`gcloud compute ssh/scp --tunnel-through-iap` uses WebSocket upgrades to `tunnel.cloudproxy.app`, which the egress proxy explicitly blocks. Claude Code cloud sessions CANNOT SSH to the VM. The user must SSH from their own laptop. Direct TCP to database ports (e.g., 9563, 5433) is also blocked.
-
 ## VM Database Passwords
+
+**These are committed to a public repo.** TODO (user decision pending): move them to a gitignored `.env` and rotate. Do not add new secrets to tracked files; generate random passwords when one is needed.
 
 | Database | Password |
 |----------|----------|
@@ -37,70 +59,78 @@ Note: `CLOUDSDK_AUTH_ACCESS_TOKEN` is set to `proxy-injected` by the environment
 | Vertica | `ISn7D4o7psvJJ9WAxqPIm8H` |
 | CUBRID | `TapSnlMKuWhuiGirAWlTCquZ` |
 | Mimer | `cHGH1buf8XGnLS5CeuI8xjZ` |
-| IRIS | `I1DzGh0z0@YoJw` |
+| IRIS | `I1DzGh0z0@YoJw` (`_SYSTEM`; changed in the portal on 2026-11-20) |
 | H2 | no password (`sa`/``) |
 
 ## Running Databases (Docker Compose on VM)
 
-| Database | Port | Status |
-|----------|------|--------|
-| InterSystems IRIS Community | 1972 | Running |
-| Exasol | 9563 | Running |
-| Apache Geode | 10334 / 40404 | Running |
+| Database | Ports | Status |
+|----------|-------|--------|
+| InterSystems IRIS Community | 1972, portal 52773 | Running |
+| Exasol | 8563 (unencrypted — used by seeder and connector), 9563 (TLS) | Running |
+| Apache Geode | 10334 locator / 40404 server / 7070 locator HTTP / 8081 dev REST (pending, see below) | Running |
 | CUBRID | 33000 | Running |
 | Mimer SQL | 1360 | Running |
-| H2 | 9092 | Running |
+| H2 | 9092 TCP, 8082 web console | Running |
 | VoltDB | 21212 | SKIPPED — Developer Edition requires a paid license file |
 | Vertica | 5433 | Needs Docker Hub login to pull `vertica/vertica-ce` — TODO |
 
-To start Vertica once Docker Hub credentials are available:
+To start Vertica once Docker Hub credentials are available (on the VM):
 ```bash
-gcloud compute ssh sdk-test-dbs --zone=us-central1-a --project=internal-sales --tunnel-through-iap \
-  --command="echo \$DOCKER_HUB_TOKEN | docker login --username \$DOCKER_HUB_USER --password-stdin && cd /opt/sdk-test-dbs && docker compose pull vertica && docker compose up -d vertica"
+echo "$DOCKER_HUB_TOKEN" | docker login --username "$DOCKER_HUB_USER" --password-stdin
+cd /opt/sdk-test-dbs && docker compose pull vertica && docker compose up -d vertica
 ```
+
+## Seeding
+
+Each database gets `customers` (1M rows: id, name, email, created_at, updated_at, status) and `orders` (10M rows: id, customer_id, amount, status, created_at, updated_at). Geode gets 100K / 1M because it loads over REST. Data is deterministic (fixed Faker/random seeds).
+
+```bash
+sudo bash /opt/sdk-test-dbs/connectors/seed_all.sh iris cubrid   # any subset; no args = all six
+```
+
+- The script resets the checkout to `origin/main` and re-runs the updated copy, so uncommitted edits on the VM are wiped. To test local edits: `sudo SEED_SKIP_UPDATE=1 bash /opt/sdk-test-dbs/connectors/seed_all.sh <db>`.
+- Piping into `tee` hides the exit code; read the final `FAILED databases:` / `All requested databases seeded` line.
+- To iterate on one DB, run the seeder directly with small counts first:
+  ```bash
+  source /opt/sdk-test-dbs/venv/bin/activate
+  python /opt/sdk-test-dbs/connectors/seed_data.py --db h2 --host localhost --customers 1000 --orders 10000
+  ```
+- Only Exasol truncates before loading. The other SQL seeders have primary keys, so after a partial failure truncate the tables before re-running.
+
+### Seeding status (2026-11-20)
+
+| DB | Status | Notes |
+|----|--------|-------|
+| Exasol | Seeded, **probably twice** | It ran twice before the TRUNCATE fix and has no primary key. Re-run `seed_all.sh exasol` to reload cleanly. |
+| IRIS | Failed: Access Denied | The failing run probably used an older `seed_all.sh` with the pre-portal password. Retry first. |
+| CUBRID | Failed: Invalid connection handle | The newest `CUBRID-Python` (9.3.0.2) predates Python 3.14. Options: a separate Python 3.11 venv for CUBRID, or the CUBRID JDBC driver via jaydebeapi (Java is installed for H2). The connection-string fix (`CUBRID:host:33000:testdb:::`) has not run yet. |
+| Mimer | Failed: `libmimerapi.so` not found | `seed_all.sh` copies it from `/usr/lib` or `/usr/local/lib` in the container — unverified; locate it with `docker exec mimer find / -name 'libmimerapi*'`. `CREATE TABLE IF NOT EXISTS` support in Mimer is also unverified. |
+| Geode | Failed: connection refused on 7070 | The dev REST API was moved to 8081 because the locator in the same container owns 7070. Apply the new `geode` command and port mapping from the repo compose to the VM compose file, then `docker compose up -d geode`. Regions are created with gfsh via `docker exec`; the multi-key PUT loader has only been tested against a fake server. |
+| H2 | Failed: EOFException on 9092 | The JDBC URL fix (`jdbc:h2:tcp://host:9092//opt/h2-data/test`) has not run yet. Check that the container's H2 version matches the 2.2.224 client jar; H2 2.x also refuses remote database creation unless started with `-ifNotExists`. |
+| Vertica | Not running | Needs Docker Hub login |
+| VoltDB | Skipped | No free license |
 
 ## Connector Code
 
-All connectors at `/home/user/fivetran/connectors/<name>/`:
+One directory per connector in this repo (`<name>/connector.py`, `configuration.json`, `requirements.txt`). Set the host in `configuration.json` (`localhost` when running `fivetran debug` on the VM, `35.202.214.246` from elsewhere).
 
 | Connector | Driver | Sync strategy | Status |
 |-----------|--------|---------------|--------|
-| vertica | vertica-python | cursor on updated_at | Written, not tested |
-| iris | sqlalchemy-iris | cursor on updated_at | Written, not tested |
-| exasol | pyexasol | cursor on updated_at | Written, not tested |
-| voltdb | requests (REST) | cursor on updated_at | SKIPPED — no free Docker image available |
-| geode | requests (REST) | cursor on updated_at | Written, not tested |
-| cubrid | CUBRID-Python | cursor on updated_at | Written, not tested |
-| mimer | mimerpy | cursor on updated_at | Written, not tested |
-| h2 | jaydebeapi + JPype1 | cursor on updated_at | Written, not tested |
+| vertica | vertica-python | cursor on updated_at | Not yet run against a real DB |
+| iris | sqlalchemy-iris | cursor on updated_at | Not yet run against a real DB |
+| exasol | pyexasol | cursor on updated_at | Not yet run against a real DB |
+| voltdb | requests (REST) | cursor on updated_at | SKIPPED |
+| geode | requests (REST, port 8081) | cursor on updated_at | Not yet run against a real DB |
+| cubrid | CUBRID-Python | cursor on updated_at | Not yet run against a real DB |
+| mimer | mimerpy | cursor on updated_at | Not yet run against a real DB |
+| h2 | jaydebeapi + JPype1 | cursor on updated_at | Not yet run against a real DB |
 
-Each connector directory has:
-- `connector.py` — main connector logic
-- `configuration.json` — connection config (update `<VM_STATIC_IP>` → `35.202.214.246`)
-- `requirements.txt` — Python dependencies
-
-## Test Data Schema
-
-Each database gets seeded with:
-- `customers` — 1M rows (id, name, email, created_at, updated_at, status)
-- `orders` — 10M rows (id, customer_id, amount, status, created_at, updated_at)
-
-Seed script: `seed_data.py` (in this directory)
-Test scenarios SQL: `test_scenarios.sql` (in this directory)
-Docker Compose: `docker-compose.yml` (in this directory)
-
-The seed script must be run ON the VM (not from a cloud session) because database ports are not reachable from Claude Code cloud sessions. From your laptop:
-```bash
-gcloud compute ssh sdk-test-dbs --zone=us-central1-a --project=internal-sales --tunnel-through-iap
-# then inside the VM:
-pip3 install faker pyexasol vertica-python
-python3 /tmp/seed_data.py --db exasol --host localhost --password exasol
-python3 /tmp/seed_data.py --db vertica --host localhost --password ISn7D4o7psvJJ9WAxqPIm8H
-```
+`fivetran debug` has so far only been run from cloud sessions, which cannot reach the databases.
 
 ## Test Scenarios
 
-12 scenarios in `/tmp/claude-0/-home-user/5fc22e03-c98c-5c31-829d-7109aed7c2d0/scratchpad/test_scenarios.sql`:
+12 scenarios in `test_scenarios.sql` (this repo):
 1. Initial sync baseline
 2. Incremental — new rows
 3. Incremental — updates
@@ -136,15 +166,15 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 
 | Variable | Purpose |
 |----------|---------|
-| `GCLOUD_SERVICE_ACCOUNT_KEY` | GCP service account JSON for `sdk-test-deploy@internal-sales.iam.gserviceaccount.com` |
+| `GCLOUD_SERVICE_ACCOUNT_KEY` | GCP service account JSON for `sdk-test-deploy@internal-sales.iam.gserviceaccount.com` (cloud sessions) |
 | `DOCKER_HUB_USER` | Docker Hub username (for pulling `vertica/vertica-ce`) |
 | `DOCKER_HUB_TOKEN` | Docker Hub personal access token |
 
 ## Next Steps
 
-1. Get Vertica container running (needs Docker Hub login on VM)
-2. Investigate VoltDB replacement image
-3. Seed data into each running database (`seed_data.py`)
-4. Run `fivetran debug` for each connector to test connections
-5. Run test scenarios against each connector
-6. `fivetran deploy` to Fivetran workspace for end-to-end testing
+1. Reload Exasol cleanly, then get IRIS, CUBRID, Mimer, Geode and H2 seeded (see the status table)
+2. Run `fivetran debug` for each connector on the VM against `localhost`
+3. Run the test scenarios against each connector
+4. Get Vertica running (Docker Hub login)
+5. Move credentials out of the repo and rotate them
+6. `fivetran deploy` to a Fivetran workspace for end-to-end testing

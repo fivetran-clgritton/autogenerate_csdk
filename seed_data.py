@@ -155,6 +155,9 @@ def seed_exasol(host, password):
                 id INT, customer_id INT, amount DECIMAL(10,2),
                 status VARCHAR(20), created_at TIMESTAMP, updated_at TIMESTAMP
             )""")
+        # No primary keys here, so a re-run would append duplicates without this
+        conn.execute("TRUNCATE TABLE customers")
+        conn.execute("TRUNCATE TABLE orders")
         conn.import_from_iterable(customer_rows(CUST_COUNT), "customers")
         conn.import_from_iterable(order_rows(ORD_COUNT),    "orders")
     print("Exasol seeded.")
@@ -258,41 +261,68 @@ def seed_mimer(host, password):
 
 
 # ── Geode ───────────────────────────────────────────────────────────────────────
-def seed_geode(host):
-    import requests
-    base = f"http://{host}:7070/geode/v1"
+# The dev REST API runs on the cache server; the locator in the same container already owns 7070.
+GEODE_REST_PORT = 8081
+# Keys per multi-key PUT; keeps the comma-separated key list well under Jetty's 8KB header limit.
+GEODE_BATCH = 500
 
-    # Create regions (idempotent — ignore 409 conflict)
+
+def create_geode_regions():
+    # The dev REST API can't create regions, so use gfsh inside the container.
+    import subprocess
+    names = subprocess.run(["docker", "ps", "--filter", "name=geode", "--format", "{{.Names}}"],
+                           capture_output=True, text=True, check=True).stdout.split()
+    if not names:
+        raise RuntimeError("No running Geode container found")
+    cmd = ["docker", "exec", names[0], "gfsh", "-e", "connect --locator=localhost[10334]"]
     for region in ("customers", "orders"):
-        r = requests.post(f"{base}/regions",
-                          json={"name": region, "type": "REPLICATE_PERSISTENT"})
-        if r.status_code not in (200, 201, 409):
-            r.raise_for_status()
+        cmd += ["-e", f"create region --name={region} --type=REPLICATE_PERSISTENT --if-not-exists"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"gfsh region creation failed:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
 
-    print("Seeding Geode customers...")
-    for i, row in enumerate(customer_rows(CUST_COUNT), 1):
-        id_, name, email, created_at, updated_at, status = row
-        requests.put(f"{base}/customers/{id_}", json={
-            "id": id_, "name": name, "email": email,
-            "created_at": created_at.isoformat(),
-            "updated_at": updated_at.isoformat(),
-            "status": status
-        })
-        if i % 10_000 == 0:
-            print(f"  customers: {i:,}/{CUST_COUNT:,}")
 
-    print("Seeding Geode orders...")
-    for i, row in enumerate(order_rows(ORD_COUNT), 1):
-        id_, customer_id, amount, status, created_at, updated_at = row
-        requests.put(f"{base}/orders/{id_}", json={
-            "id": id_, "customer_id": customer_id,
-            "amount": float(amount), "status": status,
-            "created_at": created_at.isoformat(),
-            "updated_at": updated_at.isoformat()
-        })
-        if i % 100_000 == 0:
-            print(f"  orders: {i:,}/{ORD_COUNT:,}")
+def seed_geode(host):
+    import json
+    import requests
+    base = f"http://{host}:{GEODE_REST_PORT}/geode/v1"
+    s = requests.Session()
 
+    deadline = time.time() + 180
+    while True:
+        try:
+            s.get(base, timeout=5)
+            break
+        except requests.ConnectionError:
+            if time.time() > deadline:
+                raise RuntimeError(f"Geode REST API not reachable at {base} after 3 minutes")
+            print("  waiting for Geode REST API...")
+            time.sleep(10)
+
+    create_geode_regions()
+
+    def load(region, rows, total, to_doc):
+        done, batch = 0, []
+        for row in rows:
+            batch.append(to_doc(row))
+            if len(batch) == GEODE_BATCH or done + len(batch) == total:
+                keys = ",".join(str(d["id"]) for d in batch)
+                r = s.put(f"{base}/{region}/{keys}", data=json.dumps(batch),
+                          headers={"Content-Type": "application/json"}, timeout=120)
+                if not r.ok:
+                    raise RuntimeError(f"PUT {region} failed ({r.status_code}): {r.text[:500]}")
+                done += len(batch)
+                batch = []
+                if done % 100_000 == 0:
+                    print(f"  {region}: {done:,}/{total:,}")
+        print(f"  {region}: {done:,} entries done")
+
+    load("customers", customer_rows(CUST_COUNT), CUST_COUNT, lambda r: {
+        "id": r[0], "name": r[1], "email": r[2],
+        "created_at": r[3].isoformat(), "updated_at": r[4].isoformat(), "status": r[5]})
+    load("orders", order_rows(ORD_COUNT), ORD_COUNT, lambda r: {
+        "id": r[0], "customer_id": r[1], "amount": float(r[2]), "status": r[3],
+        "created_at": r[4].isoformat(), "updated_at": r[5].isoformat()})
     print("Geode seeded.")
 
 
