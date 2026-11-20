@@ -221,3 +221,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code worktree metadata
+.claude/
+
+# Connector credentials (never commit real keys)
+connectors/**/configuration.json
