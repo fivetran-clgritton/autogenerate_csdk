@@ -1,0 +1,6 @@
+{
+  "api_key": "YOUR_SEMRUSH_API_KEY",
+  "domains": "example.com,example2.com",
+  "keywords": "seo tool,keyword research",
+  "database": "us"
+}
