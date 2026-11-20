@@ -1,0 +1,7 @@
+{
+  "tenant_url": "https://your-tenant.acumatica.com",
+  "username": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD",
+  "company": "YOUR_COMPANY",
+  "branch": "MAIN"
+}
