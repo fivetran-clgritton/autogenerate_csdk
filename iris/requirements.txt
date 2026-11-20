@@ -1,0 +1,3 @@
+sqlalchemy-iris>=0.11.0
+sqlalchemy>=2.0.0
+fivetran-connector-sdk

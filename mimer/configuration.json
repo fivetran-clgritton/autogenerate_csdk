@@ -1,0 +1,7 @@
+{
+  "host": "<VM_STATIC_IP>",
+  "port": "1360",
+  "username": "SYSADM",
+  "password": "<MIMER_PASS>",
+  "database": "testdb"
+}

@@ -1,0 +1,8 @@
+{
+  "host": "35.202.214.246",
+  "port": "5433",
+  "database": "VMart",
+  "user": "dbadmin",
+  "password": "ISn7D4o7psvJJ9WAxqPIm8H",
+  "batch_size": "10000"
+}

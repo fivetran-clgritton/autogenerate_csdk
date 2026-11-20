@@ -1,0 +1,7 @@
+{
+  "host": "<VM_STATIC_IP>",
+  "port": "9092",
+  "username": "sa",
+  "password": "",
+  "database": "~/test"
+}
