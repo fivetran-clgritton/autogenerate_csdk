@@ -4,7 +4,7 @@ Seed all test databases with stress-test data.
 Schema: customers (1M rows) + orders (10M rows) per DB.
 Run after containers are healthy:  python3 seed_data.py [--db vertica|iris|...]
 
-pip install faker vertica-python sqlalchemy-iris pyexasol voltdb3 jaydebeapi
+pip install faker vertica-python sqlalchemy-iris pyexasol jaydebeapi CUBRIDdb mimerpy requests
 """
 import argparse
 import random
@@ -99,12 +99,14 @@ def seed_vertica(host, password):
 
 # ── InterSystems IRIS ──────────────────────────────────────────────────────────
 def seed_iris(host, password):
-    import iris  # pip install sqlalchemy-iris installs the driver
     import sqlalchemy
-    engine = sqlalchemy.create_engine(f"iris://_SYSTEM:{password}@{host}:1972/USER")
+    engine = sqlalchemy.create_engine(
+        f"iris://_SYSTEM:{password}@{host}:1972/USER",
+        connect_args={"timeout": 30}
+    )
     with engine.begin() as conn:
         conn.execute(sqlalchemy.text("""
-            CREATE TABLE IF NOT EXISTS customers (
+            CREATE TABLE IF NOT EXISTS SQLUser.customers (
                 id INT NOT NULL PRIMARY KEY,
                 name VARCHAR(100),
                 email VARCHAR(200),
@@ -113,7 +115,7 @@ def seed_iris(host, password):
                 status VARCHAR(20)
             )"""))
         conn.execute(sqlalchemy.text("""
-            CREATE TABLE IF NOT EXISTS orders (
+            CREATE TABLE IF NOT EXISTS SQLUser.orders (
                 id INT NOT NULL PRIMARY KEY,
                 customer_id INT,
                 amount NUMERIC(10,2),
@@ -121,14 +123,26 @@ def seed_iris(host, password):
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )"""))
-    # IRIS needs row-by-row via ODBC for large inserts; use pyodbc batch approach
-    print("IRIS schema created — use bulk load or the IRIS %SQL.Statement for large inserts.")
+
+    # Insert in batches using raw connection
+    raw = engine.raw_connection()
+    cur = raw.cursor()
+    insert_batches(cur,
+        "INSERT INTO SQLUser.customers VALUES (?,?,?,?,?,?)",
+        customer_rows, CUST_COUNT, "customers")
+    insert_batches(cur,
+        "INSERT INTO SQLUser.orders VALUES (?,?,?,?,?,?)",
+        order_rows, ORD_COUNT, "orders")
+    raw.commit()
+    raw.close()
+    print("IRIS seeded.")
 
 
 # ── Exasol ─────────────────────────────────────────────────────────────────────
 def seed_exasol(host, password):
     import pyexasol
-    with pyexasol.connect(dsn=f"{host}:8563", user='sys', password=password, websocket_sslopt={"cert_reqs": 0}) as conn:
+    with pyexasol.connect(dsn=f"{host}:8563", user='sys', password=password,
+                          websocket_sslopt={"cert_reqs": 0}) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS customers (
                 id INT, name VARCHAR(100), email VARCHAR(200),
@@ -146,7 +160,6 @@ def seed_exasol(host, password):
 
 # ── VoltDB ─────────────────────────────────────────────────────────────────────
 def seed_voltdb(host, password):
-    # VoltDB uses its own Java/Python client; DDL via sqlcmd or REST
     import requests
     base = f"http://{host}:8080/api/1.0/"
     def sql(q):
@@ -163,10 +176,16 @@ def seed_voltdb(host, password):
 
 # ── H2 ─────────────────────────────────────────────────────────────────────────
 def seed_h2(host):
-    import jaydebeapi
+    import jaydebeapi, os, urllib.request
+    jar = "/opt/h2-data/h2.jar"
+    if not os.path.exists(jar):
+        os.makedirs("/opt/h2-data", exist_ok=True)
+        print("Downloading H2 jar...")
+        urllib.request.urlretrieve(
+            "https://repo1.maven.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.jar", jar)
     conn = jaydebeapi.connect("org.h2.Driver",
                               f"jdbc:h2:tcp://{host}:9092/~/test",
-                              ["sa", ""], "/opt/h2-data/h2.jar")
+                              ["sa", ""], jar)
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (
@@ -187,15 +206,98 @@ def seed_h2(host):
     print("H2 seeded.")
 
 
-DB_SEEDERS = {
-    "vertica": seed_vertica,
-    "exasol":  seed_exasol,
-    "h2":      seed_h2,
-}
+# ── CUBRID ──────────────────────────────────────────────────────────────────────
+def seed_cubrid(host, password):
+    import CUBRIDdb
+    conn = CUBRIDdb.connect(f"CUBRID:{host}:33000:testdb:::{{}}", "dba", password)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            id INT PRIMARY KEY, name VARCHAR(100), email VARCHAR(200),
+            created_at DATETIME, updated_at DATETIME, status VARCHAR(20)
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INT PRIMARY KEY, customer_id INT, amount NUMERIC(10,2),
+            status VARCHAR(20), created_at DATETIME, updated_at DATETIME
+        )""")
+    insert_batches(cur, "INSERT INTO customers VALUES (?,?,?,?,?,?)",
+                   customer_rows, CUST_COUNT, "customers")
+    insert_batches(cur, "INSERT INTO orders VALUES (?,?,?,?,?,?)",
+                   order_rows, ORD_COUNT, "orders")
+    conn.commit()
+    conn.close()
+    print("CUBRID seeded.")
+
+
+# ── Mimer ───────────────────────────────────────────────────────────────────────
+def seed_mimer(host, password):
+    import mimerpy
+    conn = mimerpy.connect(dsn=f"{host}:1360", user="SYSADM", password=password)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS SYSADM.customers (
+            id INTEGER PRIMARY KEY, name NVARCHAR(100), email NVARCHAR(200),
+            created_at TIMESTAMP(6), updated_at TIMESTAMP(6), status NVARCHAR(20)
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS SYSADM.orders (
+            id INTEGER PRIMARY KEY, customer_id INTEGER, amount DECIMAL(10,2),
+            status NVARCHAR(20), created_at TIMESTAMP(6), updated_at TIMESTAMP(6)
+        )""")
+    # Mimer doesn't support executemany well; use autocommit + individual inserts in batches
+    insert_batches(cur, "INSERT INTO SYSADM.customers VALUES (?,?,?,?,?,?)",
+                   customer_rows, CUST_COUNT, "customers")
+    insert_batches(cur, "INSERT INTO SYSADM.orders VALUES (?,?,?,?,?,?)",
+                   order_rows, ORD_COUNT, "orders")
+    conn.close()
+    print("Mimer seeded.")
+
+
+# ── Geode ───────────────────────────────────────────────────────────────────────
+def seed_geode(host):
+    import requests
+    base = f"http://{host}:7070/geode/v1"
+
+    # Create regions (idempotent — ignore 409 conflict)
+    for region in ("customers", "orders"):
+        r = requests.post(f"{base}/regions",
+                          json={"name": region, "type": "REPLICATE_PERSISTENT"})
+        if r.status_code not in (200, 201, 409):
+            r.raise_for_status()
+
+    print("Seeding Geode customers...")
+    for i, row in enumerate(customer_rows(CUST_COUNT), 1):
+        id_, name, email, created_at, updated_at, status = row
+        requests.put(f"{base}/customers/{id_}", json={
+            "id": id_, "name": name, "email": email,
+            "created_at": created_at.isoformat(),
+            "updated_at": updated_at.isoformat(),
+            "status": status
+        })
+        if i % 10_000 == 0:
+            print(f"  customers: {i:,}/{CUST_COUNT:,}")
+
+    print("Seeding Geode orders...")
+    for i, row in enumerate(order_rows(ORD_COUNT), 1):
+        id_, customer_id, amount, status, created_at, updated_at = row
+        requests.put(f"{base}/orders/{id_}", json={
+            "id": id_, "customer_id": customer_id,
+            "amount": float(amount), "status": status,
+            "created_at": created_at.isoformat(),
+            "updated_at": updated_at.isoformat()
+        })
+        if i % 100_000 == 0:
+            print(f"  orders: {i:,}/{ORD_COUNT:,}")
+
+    print("Geode seeded.")
+
 
 if __name__ == "__main__":
+    ALL_DBS = ["vertica", "iris", "exasol", "voltdb", "h2", "cubrid", "mimer", "geode"]
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db", required=True, choices=list(DB_SEEDERS) + ["iris","voltdb"])
+    parser.add_argument("--db", required=True, choices=ALL_DBS)
     parser.add_argument("--host", default="<VM_STATIC_IP>")
     parser.add_argument("--password", default="")
     parser.add_argument("--customers", type=int, default=CUST_COUNT)
@@ -216,4 +318,10 @@ if __name__ == "__main__":
         seed_voltdb(args.host, args.password)
     elif args.db == "h2":
         seed_h2(args.host)
+    elif args.db == "cubrid":
+        seed_cubrid(args.host, args.password)
+    elif args.db == "mimer":
+        seed_mimer(args.host, args.password)
+    elif args.db == "geode":
+        seed_geode(args.host)
     print(f"Done in {time.time()-start:.1f}s")

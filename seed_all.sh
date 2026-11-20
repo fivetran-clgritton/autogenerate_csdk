@@ -1,20 +1,35 @@
 #!/bin/bash
+set -euo pipefail
 
 cd /opt/sdk-test-dbs
 
-# Fix ownership
+# Fix ownership so git pull works
 chown -R CLAbeel:CLAbeel /opt/sdk-test-dbs/connectors 2>/dev/null || true
 
 # Pull latest code
 cd connectors && git pull && cd ..
 
-# Restart Exasol with updated compose (port 8563)
+# Install Java for H2/jaydebeapi (idempotent)
+if ! command -v java &>/dev/null; then
+    echo "Installing Java..."
+    apt-get install -y --no-install-recommends default-jre-headless
+fi
+
+# Install missing Python packages
+source venv/bin/activate
+pip install --quiet CUBRIDdb mimerpy 2>&1 | tail -5
+
+# Restart Exasol with updated compose (port 8563) if not already up
 docker compose up -d exasol
 echo "Waiting 30s for Exasol to initialize..."
 sleep 30
 
-# Activate venv
-source venv/bin/activate
+# Reset IRIS _SYSTEM password so programmatic login works
+# IRIS Community requires password change on first use; force it via irisdb exec
+echo "Resetting IRIS _SYSTEM password..."
+docker exec iris iris session IRIS -U '%SYS' \
+  '##class(Security.Users).ChangePassword("_SYSTEM","SYS","SYS")' 2>/dev/null || \
+  echo "IRIS password reset skipped (may already be set)"
 
 FAILED=()
 
