@@ -1,13 +1,19 @@
 #!/bin/bash
-set -euo pipefail
 
-cd /opt/sdk-test-dbs
+REPO=/opt/sdk-test-dbs/connectors
+COMPOSE_DIR=/opt/sdk-test-dbs
 
-# Fix ownership so git pull works
-chown -R CLAbeel:CLAbeel /opt/sdk-test-dbs/connectors 2>/dev/null || true
+# Fix ownership so git operations work
+chown -R CLAbeel:CLAbeel "$REPO" 2>/dev/null || true
 
-# Pull latest code
-cd connectors && git pull && cd ..
+# Pull latest code — discard any local edits (VM is never the source of truth)
+cd "$REPO"
+git fetch origin main
+git checkout -- .
+git reset --hard origin/main
+echo "Code updated."
+
+cd "$COMPOSE_DIR"
 
 # Install Java for H2/jaydebeapi (idempotent)
 if ! command -v java &>/dev/null; then
@@ -16,11 +22,11 @@ if ! command -v java &>/dev/null; then
 fi
 
 # Install missing Python packages
-source venv/bin/activate
+source /opt/sdk-test-dbs/venv/bin/activate
 pip install --quiet CUBRIDdb mimerpy 2>&1 | tail -5
 
-# Restart Exasol with updated compose (port 8563) if not already up
-docker compose up -d exasol
+# Ensure Exasol is up (idempotent)
+docker compose -f /opt/sdk-test-dbs/docker-compose.yml up -d exasol 2>&1 | grep -v "already allocated" || true
 echo "Waiting 30s for Exasol to initialize..."
 sleep 30
 
@@ -38,7 +44,7 @@ seed_db() {
     shift
     echo ""
     echo "=== Seeding $name ==="
-    if python connectors/seed_data.py "$@" 2>&1; then
+    if python /opt/sdk-test-dbs/connectors/seed_data.py "$@" 2>&1; then
         echo "=== $name: SUCCESS ==="
     else
         echo "=== $name: FAILED ==="
