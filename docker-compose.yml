@@ -1,0 +1,135 @@
+version: '3.8'
+
+# SDK test infrastructure — internal-sales GCP project
+# Data volumes live on /mnt/data (500GB SSD persistent disk)
+# Passwords come from .env — never commit that file
+
+services:
+  vertica:
+    image: vertica/vertica-ce:latest
+    environment:
+      APP_DB_USER: dbadmin
+      APP_DB_PASSWORD: ${VERTICA_PASS}
+    ports:
+      - "5433:5433"
+    volumes:
+      - vertica-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/opt/vertica/bin/vsql", "-U", "dbadmin", "-c", "SELECT 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  iris:
+    image: intersystemsdc/iris-community:latest
+    ports:
+      - "1972:1972"
+      - "52773:52773"   # management portal
+    volumes:
+      - iris-data:/usr/irissys/mgr
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "iris", "session", "IRIS", "-U", "%SYS", "##class(%SYS.ProcessQuery).CountByName(\"cspdaemon\")"]
+      interval: 30s
+      retries: 5
+      start_period: 90s
+
+  exasol:
+    image: exasol/docker-db:latest
+    privileged: true          # required by Exasol
+    ports:
+      - "9563:9563"
+      - "8888:8888"           # EXAoperation web UI
+    volumes:
+      - exasol-data:/exa
+    restart: unless-stopped
+    shm_size: '4gb'
+
+  voltdb:
+    image: voltdb/voltdb-community:latest
+    environment:
+      HOST_COUNT: 1
+    ports:
+      - "21212:21212"         # client port
+      - "21211:21211"         # admin port
+      - "8080:8080"           # web console
+    volumes:
+      - voltdb-data:/var/voltdb
+    restart: unless-stopped
+
+  geode:
+    image: apachegeode/geode:latest
+    ports:
+      - "10334:10334"         # locator
+      - "40404:40404"         # cache server
+      - "7070:7070"           # Pulse UI
+    volumes:
+      - geode-data:/data
+    command: >
+      bash -c "
+        gfsh start locator --name=locator1 --port=10334 --bind-address=0.0.0.0 --dir=/data/locator &&
+        sleep 10 &&
+        gfsh -e 'connect --locator=localhost[10334]'
+             -e 'start server --name=server1 --server-port=40404 --bind-address=0.0.0.0 --dir=/data/server' &&
+        tail -f /data/locator/locator1.log
+      "
+    restart: unless-stopped
+
+  cubrid:
+    image: cubrid/cubrid:11.3
+    environment:
+      CUBRID_DB: testdb
+      CUBRID_USER: dba
+      CUBRID_PASSWORD: ${CUBRID_PASS}
+    ports:
+      - "33000:33000"
+    volumes:
+      - cubrid-data:/var/opt/cubrid
+    restart: unless-stopped
+
+  mimer:
+    image: mimersql/mimersql_v11.0:latest
+    environment:
+      MIMER_SYSADM_PASSWORD: ${MIMER_PASS}
+    ports:
+      - "1360:1360"
+    volumes:
+      - mimer-data:/etc/mimer
+    restart: unless-stopped
+
+  h2:
+    image: oscarfonts/h2:latest
+    ports:
+      - "9092:9092"           # TCP server (use this in connectors)
+      - "8082:8082"           # web console
+    volumes:
+      - h2-data:/opt/h2-data
+    restart: unless-stopped
+
+volumes:
+  vertica-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /mnt/data/vertica }
+  iris-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /mnt/data/iris }
+  exasol-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /mnt/data/exasol }
+  voltdb-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /mnt/data/voltdb }
+  geode-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /mnt/data/geode }
+  cubrid-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /mnt/data/cubrid }
+  mimer-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /mnt/data/mimer }
+  h2-data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /mnt/data/h2 }

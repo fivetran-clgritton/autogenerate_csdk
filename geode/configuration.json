@@ -1,0 +1,6 @@
+{
+  "host": "GEODE_HOST_IP",
+  "rest_port": "7070",
+  "locator_port": "10334",
+  "regions": "customers,orders"
+}

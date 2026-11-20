@@ -1,0 +1,7 @@
+{
+  "host": "<VM_STATIC_IP>",
+  "port": "33000",
+  "database": "testdb",
+  "username": "dba",
+  "password": "<CUBRID_PASS>"
+}

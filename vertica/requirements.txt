@@ -1,0 +1,2 @@
+vertica-python==1.3.10
+fivetran-connector-sdk==1.5.4

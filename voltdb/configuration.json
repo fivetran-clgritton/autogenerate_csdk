@@ -1,0 +1,6 @@
+{
+  "host": "<VM_STATIC_IP>",
+  "port": 8080,
+  "username": "",
+  "password": ""
+}
