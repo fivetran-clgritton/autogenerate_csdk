@@ -50,7 +50,7 @@ Note: `CLOUDSDK_AUTH_ACCESS_TOKEN` is set to `proxy-injected` by the environment
 | CUBRID | 33000 | Running |
 | Mimer SQL | 1360 | Running |
 | H2 | 9092 | Running |
-| VoltDB | 21212 | Image removed from Docker Hub — needs new image (`voltactivedata/volt-ce` or similar) |
+| VoltDB | 21212 | SKIPPED — Developer Edition requires a paid license file |
 | Vertica | 5433 | Needs Docker Hub login to pull `vertica/vertica-ce` — TODO |
 
 To start Vertica once Docker Hub credentials are available:
@@ -68,7 +68,7 @@ All connectors at `/home/user/fivetran/connectors/<name>/`:
 | vertica | vertica-python | cursor on updated_at | Written, not tested |
 | iris | sqlalchemy-iris | cursor on updated_at | Written, not tested |
 | exasol | pyexasol | cursor on updated_at | Written, not tested |
-| voltdb | requests (REST) | cursor on updated_at | Written, not tested |
+| voltdb | requests (REST) | cursor on updated_at | SKIPPED — no free Docker image available |
 | geode | requests (REST) | cursor on updated_at | Written, not tested |
 | cubrid | CUBRID-Python | cursor on updated_at | Written, not tested |
 | mimer | mimerpy | cursor on updated_at | Written, not tested |
