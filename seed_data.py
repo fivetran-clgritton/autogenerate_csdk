@@ -143,6 +143,8 @@ def seed_exasol(host, password):
     import pyexasol
     with pyexasol.connect(dsn=f"{host}:8563", user='sys', password=password,
                           websocket_sslopt={"cert_reqs": 0}) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS testdb")
+        conn.execute("OPEN SCHEMA testdb")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS customers (
                 id INT, name VARCHAR(100), email VARCHAR(200),
