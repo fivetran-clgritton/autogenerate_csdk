@@ -99,17 +99,17 @@ def update(configuration, state):
                 result = conn.execution_options(yield_per=BATCH_SIZE).execute(sql, {"cursor": cursor})
                 for row in result:
                     record, raw_updated = _to_record(cols, row)
-                    yield op.upsert(table, record)
+                    op.upsert(table=table, data=record)
                     total += 1
                     if raw_updated and raw_updated > new_cursor:
                         new_cursor = raw_updated
                     if total % BATCH_SIZE == 0:
                         # Safe to resume from here: the next sync re-reads from this timestamp (>=)
                         state[f"{table}_cursor"] = new_cursor
-                        yield op.checkpoint(state)
+                        op.checkpoint(state=state)
 
             state[f"{table}_cursor"] = new_cursor
-            yield op.checkpoint(state)
+            op.checkpoint(state=state)
             log.info(f"{table}: synced {total} rows, cursor={new_cursor}")
     finally:
         engine.dispose()

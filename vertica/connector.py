@@ -102,7 +102,7 @@ def update(configuration: dict, state: dict):
                         k: v.isoformat() if hasattr(v, "isoformat") else v
                         for k, v in row.items()
                     }
-                    yield op.upsert(table, serialized)
+                    op.upsert(table=table, data=serialized)
 
                 rows_fetched += len(rows)
                 log.info(f"{table}: {rows_fetched:,} rows so far")
@@ -110,7 +110,7 @@ def update(configuration: dict, state: dict):
                 # Checkpoint state after each batch
                 if batch_max_cursor is not None:
                     new_state = {**state, table: {cursor_col: batch_max_cursor}}
-                    yield op.checkpoint(new_state)
+                    op.checkpoint(state=new_state)
                     state = new_state
 
             log.info(f"{table}: done — {rows_fetched:,} total rows")

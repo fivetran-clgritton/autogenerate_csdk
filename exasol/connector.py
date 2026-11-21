@@ -101,12 +101,12 @@ def update(configuration: dict, state: dict):
                             record[col] = record[col].replace(tzinfo=timezone.utc).isoformat()
                     if record.get("amount") is not None:
                         record["amount"] = str(record["amount"])
-                    yield op.upsert(table, record)
+                    op.upsert(table=table, data=record)
                     total += 1
 
             if max_dt is not None:
                 state.setdefault(table, {})[CURSOR_COL] = max_dt.strftime(CURSOR_FORMAT)
-                yield op.checkpoint(state)
+                op.checkpoint(state=state)
             log.info(f"{table}: synced {total} rows, cursor={state.get(table, {}).get(CURSOR_COL)}")
     finally:
         conn.close()

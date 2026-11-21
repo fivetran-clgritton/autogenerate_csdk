@@ -103,7 +103,7 @@ def update(configuration, state):
                     for col in ["created_at", "updated_at"]:
                         if col in record and record[col] is not None:
                             record[col] = str(record[col])
-                    yield op.upsert(table, record)
+                    op.upsert(table=table, data=record)
                     row_ts = record.get(cursor_col)
                     if row_ts and (new_cursor is None or row_ts > new_cursor):
                         new_cursor = row_ts
@@ -111,7 +111,7 @@ def update(configuration, state):
 
                 if new_cursor:
                     state[f"{table}_cursor"] = new_cursor
-                    yield op.checkpoint(state)
+                    op.checkpoint(state=state)
 
             log.info(f"{table}: synced {row_count} rows, cursor={new_cursor}")
 

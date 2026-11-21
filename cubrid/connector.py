@@ -112,7 +112,7 @@ def update(configuration, state):
                     for dt_col in ("created_at", "updated_at"):
                         if record.get(dt_col) is not None:
                             record[dt_col] = _to_utc_iso(record[dt_col])
-                    yield op.upsert(table, record)
+                    op.upsert(table=table, data=record)
                     if raw_updated and raw_updated > (new_cursor or ""):
                         new_cursor = raw_updated
 
@@ -120,7 +120,7 @@ def update(configuration, state):
 
             if new_cursor and new_cursor != cursor_val:
                 state[f"{table}_cursor"] = new_cursor
-                yield op.checkpoint(state)
+                op.checkpoint(state=state)
     finally:
         conn.close()
 

@@ -114,7 +114,7 @@ def update(configuration, state):
             if not rows:
                 break
             for raw in rows:
-                yield op.upsert(region, _to_record(raw))
+                op.upsert(table=region, data=_to_record(raw))
             total += len(rows)
 
             last_ts = rows[-1].get(CURSOR_FIELD)
@@ -130,7 +130,7 @@ def update(configuration, state):
                 # Take every row at exactly this timestamp in one query, then continue strictly after it.
                 same = _oql(base, f"SELECT * FROM /{region} r WHERE r.{CURSOR_FIELD} = '{last_ts}'")
                 for raw in same:
-                    yield op.upsert(region, _to_record(raw))
+                    op.upsert(table=region, data=_to_record(raw))
                 total += len(same)
                 strict = True
             else:
@@ -138,12 +138,12 @@ def update(configuration, state):
             cursor = last_ts
 
             state[region] = {"last_updated_at": cursor}
-            yield op.checkpoint(state)
+            op.checkpoint(state=state)
 
         if cursor and cursor != last_updated:
             state[region] = {"last_updated_at": cursor}
         log.info(f"/{region}: synced {total} rows, cursor={cursor}")
-        yield op.checkpoint(state)
+        op.checkpoint(state=state)
 
 
 connector = Connector(update=update, schema=schema)

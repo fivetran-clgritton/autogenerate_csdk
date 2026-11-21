@@ -101,7 +101,7 @@ def update(configuration: dict, state: dict):
                 break
 
             for row in rows:
-                yield op.upsert(table, row)
+                op.upsert(table=table, data=row)
 
             last_row = rows[-1]
             last_id = last_row["id"]
@@ -109,7 +109,7 @@ def update(configuration: dict, state: dict):
 
             state[f"{table}_last_id"] = last_id
             state[f"{table}_cursor"] = new_cursor
-            yield op.checkpoint(state)
+            op.checkpoint(state=state)
 
             if len(rows) < PAGE_SIZE:
                 break
@@ -121,7 +121,7 @@ def update(configuration: dict, state: dict):
 
         # Reset last_id between tables so it doesn't bleed across
         state[f"{table}_last_id"] = 0
-        yield op.checkpoint(state)
+        op.checkpoint(state=state)
 
     log.info("Sync complete.")
 
