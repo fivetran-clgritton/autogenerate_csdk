@@ -14,6 +14,8 @@ Syncs SEO link metrics from the [Moz Links API v2](https://moz.com/products/api)
 
 Keep real credentials out of version control. `configuration.json` is gitignored in this repository.
 
+The connector defines a setup form, so the values can be entered in the Fivetran dashboard instead. A setup test checks the credentials with a single-target request when the connection is saved. Locally, `fivetran configuration` collects the values and `fivetran configuration --test` runs the setup test.
+
 ## Tables
 
 | Table | Primary key | Sync |

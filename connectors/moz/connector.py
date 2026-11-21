@@ -13,7 +13,7 @@ import time
 import requests
 
 # Import required classes from fivetran_connector_sdk
-from fivetran_connector_sdk import Connector
+from fivetran_connector_sdk import Connector, ConfigurationForm, Test, form_field
 
 # For enabling Logs in your connector code
 from fivetran_connector_sdk import Logging as log
@@ -42,6 +42,60 @@ def validate_configuration(configuration: dict):
             raise ValueError(f"Missing required configuration value: {key}")
     if not parse_targets(configuration):
         raise ValueError("Configuration value 'targets' must list at least one domain or URL")
+
+
+def connection_test(configuration: dict):
+    """
+    Setup test that checks the credentials with a single-target url_metrics request.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Returns:
+        A success or failure Test result shown on the Fivetran setup page.
+    """
+    test = Test()
+    try:
+        validate_configuration(configuration=configuration)
+        auth = (configuration["access_id"], configuration["secret_key"])
+        make_request(auth, "url_metrics", {"targets": parse_targets(configuration)[:1]}, max_retries=1)
+    except (ValueError, RuntimeError) as error:
+        return test.failure(str(error))
+    return test.success()
+
+
+def configuration_form():
+    """
+    Declare the setup form Fivetran renders for this connector, and its setup test.
+    Returns:
+        A ConfigurationForm with one field per configuration key and one setup test.
+    """
+    form = ConfigurationForm()
+    form.add_field(
+        form_field.TextField(
+            "access_id",
+            label="Moz access ID",
+            required=True,
+            description="Access ID from your Moz account, under API Access.",
+        )
+    )
+    form.add_field(
+        form_field.TextField(
+            "secret_key",
+            label="Moz secret key",
+            required=True,
+            field_type=form_field.TextField.password,
+            description="Secret key that belongs to the access ID.",
+        )
+    )
+    form.add_field(
+        form_field.TextField(
+            "targets",
+            label="Targets",
+            required=True,
+            description="Comma-separated domains or URLs to sync, for example example.com,example2.com.",
+        )
+    )
+    form.add_test(label="Check the credentials against Moz", func=connection_test)
+    return form
 
 
 def schema(configuration: dict):
@@ -85,19 +139,20 @@ def parse_targets(configuration: dict):
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
-def make_request(auth: tuple, endpoint: str, body: dict):
+def make_request(auth: tuple, endpoint: str, body: dict, max_retries: int = __MAX_RETRIES):
     """
     Send a POST request to the Moz API, retrying transient failures with exponential backoff.
     Args:
         auth: (access_id, secret_key) tuple used for HTTP Basic authentication.
         endpoint: the endpoint name under the base URL.
         body: the JSON request body.
+        max_retries: number of attempts before giving up; the setup test uses 1 to fail fast.
     Returns:
         The parsed JSON response body.
     Raises:
         RuntimeError: on authentication failures, other 4xx responses, or when retries are exhausted.
     """
-    for attempt in range(__MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             response = requests.post(
                 f"{__BASE_URL}/{endpoint}",
@@ -106,7 +161,7 @@ def make_request(auth: tuple, endpoint: str, body: dict):
                 timeout=__REQUEST_TIMEOUT_SECONDS,
             )
         except (requests.ConnectionError, requests.Timeout) as error:
-            if attempt == __MAX_RETRIES - 1:
+            if attempt == max_retries - 1:
                 raise RuntimeError(f"Moz request failed after retries: {error}") from error
             delay = __BACKOFF_BASE_SECONDS**attempt
             log.warning(f"Network error on {endpoint}, retrying in {delay}s: {error}")
@@ -118,6 +173,8 @@ def make_request(auth: tuple, endpoint: str, body: dict):
                 f"Moz rejected the credentials (HTTP {response.status_code}). Check access_id and secret_key."
             )
         if response.status_code == 429 or response.status_code >= 500:
+            if attempt == max_retries - 1:
+                break
             # Honor Retry-After when the API sends it, otherwise back off exponentially.
             retry_after = response.headers.get("Retry-After", "")
             delay = int(retry_after) if retry_after.isdigit() else __BACKOFF_BASE_SECONDS**attempt
@@ -127,7 +184,7 @@ def make_request(auth: tuple, endpoint: str, body: dict):
         if not response.ok:
             raise RuntimeError(f"Moz request to {endpoint} failed: HTTP {response.status_code}")
         return response.json()
-    raise RuntimeError(f"Moz request to {endpoint} still failing after {__MAX_RETRIES} retries")
+    raise RuntimeError(f"Moz request to {endpoint} still failing after {max_retries} attempt(s)")
 
 
 def sync_url_metrics(auth: tuple, targets: list):
@@ -226,7 +283,7 @@ def update(configuration: dict, state: dict):
 
 
 # Create the connector object using the schema and update functions
-connector = Connector(update=update, schema=schema)
+connector = Connector(update=update, schema=schema, configuration_form=configuration_form)
 
 # Check if the script is being run as the main module.
 # This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.
