@@ -13,7 +13,7 @@ import time
 import requests
 
 # Import required classes from fivetran_connector_sdk
-from fivetran_connector_sdk import Connector
+from fivetran_connector_sdk import Connector, ConfigurationForm, Test, form_field
 
 # For enabling Logs in your connector code
 from fivetran_connector_sdk import Logging as log
@@ -166,26 +166,27 @@ def base_url(configuration: dict):
     return __PROD_BASE_URL
 
 
-def make_request(api_key: str, url: str, params: dict):
+def make_request(api_key: str, url: str, params: dict, max_retries: int = __MAX_RETRIES):
     """
     Send a GET request to the Rillet API, retrying transient failures with exponential backoff.
     Args:
         api_key: the Rillet API key, sent as a Bearer token.
         url: the full endpoint URL.
         params: query parameters.
+        max_retries: how many attempts to make before giving up.
     Returns:
         The parsed JSON response body.
     Raises:
         RuntimeError: on authentication failures, other 4xx responses, or when retries are exhausted.
     """
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    for attempt in range(__MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             response = requests.get(
                 url, headers=headers, params=params, timeout=__REQUEST_TIMEOUT_SECONDS
             )
         except (requests.ConnectionError, requests.Timeout) as error:
-            if attempt == __MAX_RETRIES - 1:
+            if attempt == max_retries - 1:
                 raise RuntimeError(f"Rillet request failed after retries: {error}") from error
             delay = __BACKOFF_BASE_SECONDS**attempt
             log.warning(f"Network error on {url}, retrying in {delay}s: {error}")
@@ -201,13 +202,14 @@ def make_request(api_key: str, url: str, params: dict):
             # Honor Retry-After when the API sends it, otherwise back off exponentially.
             retry_after = response.headers.get("Retry-After", "")
             delay = int(retry_after) if retry_after.isdigit() else __BACKOFF_BASE_SECONDS**attempt
-            log.warning(f"HTTP {response.status_code} on {url}, retrying in {delay}s")
-            time.sleep(delay)
+            if attempt < max_retries - 1:
+                log.warning(f"HTTP {response.status_code} on {url}, retrying in {delay}s")
+                time.sleep(delay)
             continue
         if not response.ok:
             raise RuntimeError(f"Rillet request to {url} failed: HTTP {response.status_code}")
         return response.json()
-    raise RuntimeError(f"Rillet request to {url} still failing after {__MAX_RETRIES} retries")
+    raise RuntimeError(f"Rillet request to {url} still failing after {max_retries} attempts")
 
 
 def extract_items(body: dict):
@@ -348,6 +350,53 @@ def sync_journal_entries(api_key: str, root: str, updated_since: str):
     return latest[0]
 
 
+def connection_test(configuration: dict):
+    """
+    Setup test that checks the API key and environment with a one-row request to the accounts endpoint.
+    Makes a single attempt so a bad credential or unreachable host fails within seconds.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Returns:
+        A success or failure Test result shown on the Fivetran setup page.
+    """
+    test = Test()
+    try:
+        validate_configuration(configuration=configuration)
+        make_request(
+            configuration["api_key"], f"{base_url(configuration)}/accounts", {"limit": 1}, max_retries=1
+        )
+    except (ValueError, RuntimeError) as error:
+        return test.failure(str(error))
+    return test.success()
+
+
+def configuration_form():
+    """
+    Declare the setup form Fivetran renders for this connector, and its setup test.
+    Returns:
+        A ConfigurationForm with one field per configuration key and one setup test.
+    """
+    form = ConfigurationForm()
+    form.add_field(
+        form_field.TextField(
+            "api_key",
+            label="Rillet API key",
+            required=True,
+            field_type=form_field.TextField.password,
+            description="API key from your Rillet account. Use a sandbox key when sandbox is on.",
+        )
+    )
+    form.add_field(
+        form_field.ToggleField(
+            "use_sandbox",
+            label="Use the Rillet sandbox",
+            description="On reads from sandbox.api.rillet.com, off reads from api.rillet.com. Defaults to off.",
+        )
+    )
+    form.add_test(label="Check the API key against Rillet", func=connection_test)
+    return form
+
+
 def update(configuration: dict, state: dict):
     """
     Define the update function, which is called by Fivetran during each sync.
@@ -382,7 +431,7 @@ def update(configuration: dict, state: dict):
 
 
 # Create the connector object using the schema and update functions
-connector = Connector(update=update, schema=schema)
+connector = Connector(update=update, schema=schema, configuration_form=configuration_form)
 
 # Check if the script is being run as the main module.
 # This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.
