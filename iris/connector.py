@@ -1,97 +1,118 @@
-import fivetran_connector_sdk as fdk
-from fivetran_connector_sdk import Connector, Operations as op
-from sqlalchemy import create_engine, text
 from datetime import datetime, timezone
+
+from fivetran_connector_sdk import Connector, Logging as log, Operations as op
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 
 TABLES = ["customers", "orders"]
 SCHEMA_PREFIX = "SQLUser"
 BATCH_SIZE = 10_000
 ZERO_CURSOR = "1970-01-01 00:00:00"
 
+COLUMNS = {
+    "customers": ["id", "name", "email", "created_at", "updated_at", "status"],
+    "orders": ["id", "customer_id", "amount", "status", "created_at", "updated_at"],
+}
+
 
 def _engine(cfg):
-    host = cfg["host"]
-    port = cfg.get("port", "1972")
-    user = cfg.get("username", "_SYSTEM")
-    pw = cfg["password"]
-    ns = cfg.get("namespace", "USER")
-    return create_engine(f"iris://{user}:{pw}@{host}:{port}/{ns}")
+    # URL.create keeps characters like '@' in the password intact; an f-string URL breaks on them.
+    url = URL.create(
+        "iris",
+        username=cfg.get("username", "_SYSTEM"),
+        password=cfg["password"],
+        host=cfg["host"],
+        port=int(cfg.get("port", 1972)),
+        database=cfg.get("namespace", "USER"),
+    )
+    return create_engine(url)
 
 
 def schema(configuration):
     return [
-        fdk.SchemaBuilder()
-        .table("customers", primary_key=["id"])
-        .column("id",         fdk.DataType.INT)
-        .column("name",       fdk.DataType.STRING)
-        .column("email",      fdk.DataType.STRING)
-        .column("created_at", fdk.DataType.UTC_DATETIME)
-        .column("updated_at", fdk.DataType.UTC_DATETIME)
-        .column("status",     fdk.DataType.STRING)
-        .build(),
-        fdk.SchemaBuilder()
-        .table("orders", primary_key=["id"])
-        .column("id",          fdk.DataType.INT)
-        .column("customer_id", fdk.DataType.INT)
-        .column("amount",      fdk.DataType.DECIMAL)
-        .column("status",      fdk.DataType.STRING)
-        .column("created_at",  fdk.DataType.UTC_DATETIME)
-        .column("updated_at",  fdk.DataType.UTC_DATETIME)
-        .build(),
+        {
+            "table": "customers",
+            "primary_key": ["id"],
+            "columns": {
+                "id": "INT",
+                "name": "STRING",
+                "email": "STRING",
+                "created_at": "UTC_DATETIME",
+                "updated_at": "UTC_DATETIME",
+                "status": "STRING",
+            },
+        },
+        {
+            "table": "orders",
+            "primary_key": ["id"],
+            "columns": {
+                "id": "INT",
+                "customer_id": "INT",
+                # The SDK requires DECIMAL columns to carry precision and scale
+                "amount": {"type": "DECIMAL", "precision": 10, "scale": 2},
+                "status": "STRING",
+                "created_at": "UTC_DATETIME",
+                "updated_at": "UTC_DATETIME",
+            },
+        },
     ]
+
+
+def _to_record(cols, row):
+    """Convert a database row to a dict the SDK accepts. Returns (record, raw updated_at)."""
+    record = dict(zip(cols, row))
+    raw_updated = None
+    for key, value in record.items():
+        if isinstance(value, datetime):
+            if key == "updated_at":
+                # Keep the cursor in the database's own format; it is passed back to CAST(... AS TIMESTAMP)
+                raw_updated = value.strftime("%Y-%m-%d %H:%M:%S.%f")
+            record[key] = value.replace(tzinfo=value.tzinfo or timezone.utc).isoformat()
+        elif key == "amount" and value is not None:
+            record[key] = str(value)  # DECIMAL values must be str or int
+    return record, raw_updated
 
 
 def update(configuration, state):
     engine = _engine(configuration)
+    try:
+        for table in TABLES:
+            cursor = state.get(f"{table}_cursor", ZERO_CURSOR)
+            new_cursor = cursor
+            total = 0
+            cols = COLUMNS[table]
 
-    for table in TABLES:
-        cursor = state.get(f"{table}_cursor", ZERO_CURSOR)
-        qualified = f"{SCHEMA_PREFIX}.{table}"
-        new_cursor = cursor
-        total = 0
-
-        with engine.connect() as conn:
-            # IRIS uses TOP n, not LIMIT n; for unbounded pagination use cursor
-            # ordering by updated_at ensures we can checkpoint safely per batch
+            # >= (not >) so rows sharing the last cursor timestamp are never skipped when a sync
+            # resumes from a mid-sync checkpoint. Upserts by primary key make the re-read harmless.
+            # IRIS quirk: selecting updated_at while also ORDER BY-ing on it returns the internal
+            # sort-encoded value (e.g. '1154657064703846976') instead of a timestamp. Casting fixes it.
+            select_list = ", ".join(f"CAST({c} AS TIMESTAMP)" if c == "updated_at" else c for c in cols)
             sql = text(
-                f"SELECT * FROM {qualified} "
-                f"WHERE updated_at > CAST(:cursor AS TIMESTAMP) "
+                f"SELECT {select_list} FROM {SCHEMA_PREFIX}.{table} "
+                f"WHERE updated_at >= CAST(:cursor AS TIMESTAMP) "
                 f"ORDER BY updated_at, id"
             )
-            result = conn.execute(sql, {"cursor": cursor})
-            cols = list(result.keys())
+            log.info(f"{table}: syncing rows with updated_at >= {cursor}")
 
-            batch = []
-            for row in result:
-                record = dict(zip(cols, row))
-                # Normalise datetime objects to ISO strings for Fivetran
-                for k, v in record.items():
-                    if isinstance(v, datetime):
-                        if v.tzinfo is None:
-                            v = v.replace(tzinfo=timezone.utc)
-                        record[k] = v.isoformat()
-                batch.append(record)
+            with engine.connect() as conn:
+                # Stream rows instead of buffering the whole result client-side
+                result = conn.execution_options(yield_per=BATCH_SIZE).execute(sql, {"cursor": cursor})
+                for row in result:
+                    record, raw_updated = _to_record(cols, row)
+                    yield op.upsert(table, record)
+                    total += 1
+                    if raw_updated and raw_updated > new_cursor:
+                        new_cursor = raw_updated
+                    if total % BATCH_SIZE == 0:
+                        # Safe to resume from here: the next sync re-reads from this timestamp (>=)
+                        state[f"{table}_cursor"] = new_cursor
+                        yield op.checkpoint(state)
 
-                if record.get("updated_at") and record["updated_at"] > new_cursor:
-                    new_cursor = record["updated_at"]
-
-                if len(batch) >= BATCH_SIZE:
-                    yield op.upsert(table, batch)
-                    total += len(batch)
-                    batch = []
-                    # Checkpoint after each batch so a mid-sync restart
-                    # resumes from the last committed cursor, not the start.
-                    yield op.checkpoint({**state, f"{table}_cursor": new_cursor})
-
-            if batch:
-                yield op.upsert(table, batch)
-                total += len(batch)
-
-        state = {**state, f"{table}_cursor": new_cursor}
-        yield op.checkpoint(state)
-        fdk.log(f"iris: synced {total} rows from {table}, cursor={new_cursor}")
-
-    engine.dispose()
+            state[f"{table}_cursor"] = new_cursor
+            yield op.checkpoint(state)
+            log.info(f"{table}: synced {total} rows, cursor={new_cursor}")
+    finally:
+        engine.dispose()
 
 
 connector = Connector(update=update, schema=schema)

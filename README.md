@@ -8,11 +8,11 @@ One directory per connector, each with `connector.py`, `configuration.json` and 
 
 | Connector | Driver | Sync strategy | Status |
 |-----------|--------|---------------|--------|
-| `vertica` | vertica-python | cursor on `updated_at` | Not yet tested (no test instance running) |
-| `iris` | sqlalchemy-iris | cursor on `updated_at` | Not yet tested |
-| `exasol` | pyexasol | cursor on `updated_at` | Not yet tested |
-| `geode` | requests (dev REST API + OQL) | cursor on `updated_at` | Not yet tested |
-| `mimer` | mimerpy | cursor on `updated_at` | Not yet tested |
+| `vertica` | vertica-python | cursor on `updated_at` | Not yet tested (no test instance running; likely needs the same SDK-API fixes as the others) |
+| `iris` | sqlalchemy-iris | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
+| `exasol` | pyexasol | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
+| `geode` | requests (dev REST API + OQL) | cursor on `updated_at` | Incremental and full initial sync verified with `fivetran debug` |
+| `mimer` | mimerpy | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
 | `cubrid` | jaydebeapi + JPype1 (JDBC) | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
 | `h2` | jaydebeapi + JPype1 (JDBC) | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
 | `voltdb` | requests (REST) | cursor on `updated_at` | Skipped (the free image needs a license file) |
@@ -33,7 +33,9 @@ Notes:
 - Keep real credentials in a config file outside the repo. The checked-in `configuration.json` files only hold placeholders.
 - `fivetran debug` writes the final checkpoint back to the `--state` file, and creates `files/` (a DuckDB warehouse you can open with `duckdb -ui files/warehouse.db`) and `crash-reports/`. Both are gitignored.
 - The CUBRID and H2 connectors talk JDBC through `jaydebeapi`, which needs Java and the vendor's JDBC jar. Point to it with `jdbc_jar` (CUBRID) or `h2_jar` (H2) in the configuration. The jar should match the server version.
-- The SDK requires `DECIMAL` columns to declare `precision` and `scale` in `schema()`, and `UTC_DATETIME` values as ISO 8601 with a time zone.
+- The SDK requires `DECIMAL` columns to declare `precision` and `scale` in `schema()` (and `DECIMAL` values as strings), and `UTC_DATETIME` values as ISO 8601 with a time zone.
+- All connectors read with `updated_at >= cursor`, so rows sharing the cursor timestamp are never skipped. Re-read rows are harmless because they are upserted by primary key.
+- The Mimer connector needs `MIMER_SQLHOSTS` pointing at an SQLHOSTS file that maps `mimerdb` to the server.
 
 ## Test data
 

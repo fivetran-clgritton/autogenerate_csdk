@@ -124,21 +124,27 @@ One directory per connector in this repo (`<name>/connector.py`, `configuration.
 | Connector | Driver | Sync strategy | Status |
 |-----------|--------|---------------|--------|
 | vertica | vertica-python | cursor on updated_at | Not yet run against a real DB |
-| iris | sqlalchemy-iris | cursor on updated_at | Not yet run against a real DB |
-| exasol | pyexasol | cursor on updated_at | Not yet run against a real DB |
+| iris | sqlalchemy-iris | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
+| exasol | pyexasol | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
 | voltdb | requests (REST) | cursor on updated_at | SKIPPED |
-| geode | requests (REST, port 8081) | cursor on updated_at | Not yet run against a real DB |
+| geode | requests (REST + OQL, port 8081) | cursor on updated_at | Incremental and full initial sync verified on the VM (2026-11-21) |
 | cubrid | jaydebeapi + JPype1 (CUBRID JDBC) | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
-| mimer | mimerpy | cursor on updated_at | Not yet run against a real DB |
+| mimer | mimerpy | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
 | h2 | jaydebeapi + JPype1 | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
 
-`fivetran debug` has been run on the VM for `cubrid` and `h2` (incremental, from a late cursor); the others have not been run against a real DB yet.
+`fivetran debug` has been run on the VM for `iris`, `exasol`, `mimer`, `geode`, `cubrid` and `h2` (incremental from a late cursor: 9,989 rows each for the SQL databases; Geode's smaller dataset gives 985). Geode also had a full initial sync (100,000 customers / 1,000,000 orders, about 6 minutes, peak 393 MB). `vertica` has not run (no instance) and `voltdb` is skipped.
 
 Running `fivetran debug` on the VM:
 - The `fivetran` CLI uses system Python 3.11 and does not install connector requirements. Install JDBC deps without root: `/usr/bin/python3 -m pip install --target ~/connector-deps jaydebeapi JPype1`, then run with `PYTHONPATH=~/connector-deps`.
 - Use a scratch config/state file instead of editing `configuration.json`, so real passwords stay out of the repo. `debug` writes the final checkpoint back to the `--state` file.
 - Seeded data is dated 2022-2024. To test without syncing 11M rows, start from a late cursor, e.g. `{"customers_cursor": "2024-12-30 12:00:00", "orders_cursor": "2024-12-31 12:00:00"}`.
-- The SDK requires `DECIMAL` columns to declare `precision`/`scale` in `schema()` and `UTC_DATETIME` values as ISO 8601 with a zone; other connectors may hit the same errors.
+- The SDK requires `DECIMAL` columns to declare `precision`/`scale` in `schema()`, `DECIMAL` values as `str`/`int`, and `UTC_DATETIME` values as ISO 8601 with a zone. `schema()` returns a list of dicts (`{"table", "primary_key", "columns": {name: type}}`); there is no `SchemaBuilder` or `DataType`. `op.upsert` takes one record dict, not a list. `vertica` and `voltdb` were written against the same wrong API and will need the same treatment.
+- Connector-specific gotchas found while debugging:
+  - IRIS: selecting `updated_at` while also `ORDER BY updated_at` returns an internal sort-encoded value (e.g. `'1154657064703846976'`), so the connector selects `CAST(updated_at AS TIMESTAMP)`.
+  - Exasol: unquoted identifiers are upper-cased, so the schema is `TESTDB`; pyexasol returns timestamps as strings unless `fetch_mapper=pyexasol.exasol_mapper`; set `validate_certificate` to `false` for the self-signed test cert.
+  - Mimer: needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts` and `libmimerapi.so` on the loader path; `connect(dsn=...)` takes the database name (`mimerdb`), not host:port.
+  - Geode: OQL has no `OFFSET` and the dev REST API's `bind-values` does not work, so the connector pages by keyset on `updated_at` and validates the cursor before putting it in the query. The old key-scan fallback used a wrong URL and silently returned zero rows, so it was removed (failures now surface).
+- All connectors read with `updated_at >= cursor` (not `>`): rows sharing the cursor timestamp are never skipped on resume or with concurrent writes, and primary-key upserts make the re-read harmless.
 
 ## Test Scenarios
 
@@ -184,8 +190,7 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 
 ## Next Steps
 
-1. Run `fivetran debug` for the remaining connectors (iris, exasol, mimer, geode) on the VM against `localhost`
-2. Run the test scenarios against each connector
-3. Get Vertica running (Docker Hub login)
-4. Move credentials out of the repo and rotate them
-5. `fivetran deploy` to a Fivetran workspace for end-to-end testing
+1. Run the test scenarios against each working connector (iris, exasol, mimer, geode, cubrid, h2)
+2. Get Vertica running (Docker Hub login), then port its connector to the current SDK API and debug it
+3. Move credentials out of the repo and rotate them
+4. `fivetran deploy` to a Fivetran workspace for end-to-end testing

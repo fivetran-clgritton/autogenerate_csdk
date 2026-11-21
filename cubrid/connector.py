@@ -82,11 +82,12 @@ def update(configuration, state):
                 query = f"SELECT {cols} FROM {table} ORDER BY updated_at"
                 cur.execute(query)
             else:
-                # Incremental — only rows updated since last cursor
+                # Incremental — rows updated at or after the last cursor. >= (not >) so rows sharing the
+                # cursor timestamp are never skipped; upserts by primary key make the re-read harmless.
                 # CUBRID uses DATETIME literals; pass as string param
                 query = (
                     f"SELECT {cols} FROM {table} "
-                    f"WHERE updated_at > ? "
+                    f"WHERE updated_at >= ? "
                     f"ORDER BY updated_at"
                 )
                 cur.execute(query, (cursor_val,))

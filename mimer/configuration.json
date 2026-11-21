@@ -3,5 +3,5 @@
   "port": "1360",
   "username": "SYSADM",
   "password": "<MIMER_PASS>",
-  "database": "testdb"
+  "database": "mimerdb"
 }

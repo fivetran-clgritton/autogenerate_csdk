@@ -72,10 +72,12 @@ def update(configuration, state):
             cursor_col = meta["cursor_col"]
             last_cursor = state.get(f"{table}_cursor")
 
+            # >= (not >) so rows sharing the cursor timestamp are never skipped when a sync resumes from a
+            # per-batch checkpoint; upserts by primary key make the re-read harmless.
             if last_cursor:
                 sql = (
                     f"SELECT {', '.join(meta['columns'])} FROM {table.upper()} "
-                    f"WHERE {cursor_col} > CAST(? AS TIMESTAMP) "
+                    f"WHERE {cursor_col} >= CAST(? AS TIMESTAMP) "
                     f"ORDER BY {cursor_col}"
                 )
                 log.info(f"{table}: incremental from {last_cursor}")
