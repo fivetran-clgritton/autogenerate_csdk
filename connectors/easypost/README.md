@@ -12,6 +12,8 @@ Syncs shipments, trackers, tracking details, addresses and refunds from the [Eas
 
 Keep real keys out of version control. `configuration.json` is gitignored in this repository.
 
+The connector defines a setup form, so the key can be entered in the Fivetran dashboard instead. A setup test checks the key with a one-row request when the connection is saved. Locally, `fivetran configuration` collects the values and `fivetran configuration --test` runs the setup test.
+
 ## Tables
 
 | Table | Primary key | Sync |
