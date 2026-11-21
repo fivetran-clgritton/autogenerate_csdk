@@ -17,7 +17,7 @@ import time
 import requests
 
 # Import required classes from fivetran_connector_sdk
-from fivetran_connector_sdk import Connector
+from fivetran_connector_sdk import Connector, ConfigurationForm, Test, form_field
 
 # For enabling Logs in your connector code
 from fivetran_connector_sdk import Logging as log
@@ -59,6 +59,85 @@ def validate_configuration(configuration: dict):
         raise ValueError(f"Unsupported region '{region}'. Use one of: {', '.join(__REGION_URLS)}")
 
 
+def connection_test(configuration: dict):
+    """
+    Setup test that checks the credentials with a signed one-row request to the orders endpoint.
+    A single attempt is made, so a failing credential or unreachable region fails within seconds.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Returns:
+        A success or failure Test result shown on the Fivetran setup page.
+    """
+    test = Test()
+    try:
+        validate_configuration(configuration=configuration)
+        make_request(
+            configuration,
+            "/orders/get",
+            {"created_after": __DEFAULT_START, "limit": 1, "offset": 0},
+            max_retries=1,
+        )
+    except (ValueError, RuntimeError) as error:
+        return test.failure(str(error))
+    return test.success()
+
+
+def configuration_form():
+    """
+    Declare the setup form Fivetran renders for this connector, and its setup test.
+    Returns:
+        A ConfigurationForm with one field per configuration key and one setup test.
+    """
+    form = ConfigurationForm()
+    form.add_field(
+        form_field.TextField(
+            "app_key",
+            label="Lazada app key",
+            required=True,
+            description="App key from your app in the Lazada Open Platform console.",
+        )
+    )
+    form.add_field(
+        form_field.TextField(
+            "app_secret",
+            label="Lazada app secret",
+            required=True,
+            field_type=form_field.TextField.password,
+            description="App secret of the same app. It signs every request.",
+        )
+    )
+    form.add_field(
+        form_field.TextField(
+            "access_token",
+            label="Seller access token",
+            required=True,
+            field_type=form_field.TextField.password,
+            description="Access token from the seller authorization (OAuth) flow.",
+        )
+    )
+    form.add_field(
+        form_field.DropdownField(
+            "region",
+            label="Lazada region",
+            required=True,
+            description="The Lazada marketplace the seller account belongs to.",
+            fields=[
+                form_field.DropdownFieldParam(value=code, label=label)
+                for code, label in [
+                    ("my", "Malaysia"),
+                    ("th", "Thailand"),
+                    ("sg", "Singapore"),
+                    ("ph", "Philippines"),
+                    ("id", "Indonesia"),
+                    ("vn", "Vietnam"),
+                ]
+            ],
+        )
+    )
+    form.add_test(label="Check the credentials against Lazada", func=connection_test)
+    return form
+
+
 def schema(configuration: dict):
     """
     Define the schema function which lets you configure the schema your connector delivers.
@@ -92,7 +171,7 @@ def sign(app_secret: str, endpoint: str, params: dict):
     ).hexdigest().upper()
 
 
-def make_request(configuration: dict, endpoint: str, extra: dict):
+def make_request(configuration: dict, endpoint: str, extra: dict, max_retries: int = __MAX_RETRIES):
     """
     Send a signed GET request to the Lazada API, retrying transient failures with exponential backoff.
     The request is re-signed with a fresh timestamp on every attempt.
@@ -100,6 +179,7 @@ def make_request(configuration: dict, endpoint: str, extra: dict):
         configuration: the connector configuration holding the credentials and region.
         endpoint: the endpoint path, for example /orders/get.
         extra: endpoint-specific query parameters.
+        max_retries: attempts before giving up; the setup test passes 1 so it fails fast.
     Returns:
         The parsed JSON response body.
     Raises:
@@ -107,7 +187,7 @@ def make_request(configuration: dict, endpoint: str, extra: dict):
     """
     region = configuration.get("region", __DEFAULT_REGION).lower()
     base_url = __REGION_URLS[region]
-    for attempt in range(__MAX_RETRIES):
+    for attempt in range(max_retries):
         params = {
             "app_key": configuration["app_key"],
             "access_token": configuration["access_token"],
@@ -121,7 +201,7 @@ def make_request(configuration: dict, endpoint: str, extra: dict):
                 f"{base_url}{endpoint}", params=params, timeout=__REQUEST_TIMEOUT_SECONDS
             )
         except (requests.ConnectionError, requests.Timeout) as error:
-            if attempt == __MAX_RETRIES - 1:
+            if attempt == max_retries - 1:
                 raise RuntimeError(f"Lazada request failed after retries: {error}") from error
             delay = __BACKOFF_BASE_SECONDS**attempt
             log.warning(f"Network error on {endpoint}, retrying in {delay}s: {error}")
@@ -134,6 +214,8 @@ def make_request(configuration: dict, endpoint: str, extra: dict):
                 "Check app_key, app_secret and access_token."
             )
         if response.status_code == 429 or response.status_code >= 500:
+            if attempt == max_retries - 1:
+                break
             retry_after = response.headers.get("Retry-After", "")
             delay = int(retry_after) if retry_after.isdigit() else __BACKOFF_BASE_SECONDS**attempt
             log.warning(f"HTTP {response.status_code} on {endpoint}, retrying in {delay}s")
@@ -146,13 +228,15 @@ def make_request(configuration: dict, endpoint: str, extra: dict):
         code = data.get("code")
         if code and code != "0":
             if code == __RATE_LIMIT_CODE:
+                if attempt == max_retries - 1:
+                    break
                 delay = __BACKOFF_BASE_SECONDS**attempt
                 log.warning(f"Lazada call limit reached on {endpoint}, retrying in {delay}s")
                 time.sleep(delay)
                 continue
             raise RuntimeError(f"Lazada API error {code}: {data.get('message')}")
         return data
-    raise RuntimeError(f"Lazada request to {endpoint} still failing after {__MAX_RETRIES} retries")
+    raise RuntimeError(f"Lazada request to {endpoint} still failing after {max_retries} attempt(s)")
 
 
 def order_row(order: dict):
@@ -322,7 +406,7 @@ def update(configuration: dict, state: dict):
 
 
 # Create the connector object using the schema and update functions
-connector = Connector(update=update, schema=schema)
+connector = Connector(update=update, schema=schema, configuration_form=configuration_form)
 
 # Check if the script is being run as the main module.
 # This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.
