@@ -22,6 +22,8 @@ Building Fivetran Connector SDK connectors for legacy databases that have no man
 | `/opt/sdk-test-dbs/docker-compose.yml` | The compose file the running containers come from. It is a **separate copy**, not this repo's `docker-compose.yml` (container names differ, e.g. `exasol` vs `connectors-exasol-1`). Port or flag changes made in the repo copy must be applied here by hand. Never run `docker compose` from the repo directory — it creates a second project with blank passwords. |
 | `/opt/sdk-test-dbs/.env` | `VERTICA_PASS`, `CUBRID_PASS`, `MIMER_PASS` used by compose |
 | `/opt/sdk-test-dbs/venv` | Python 3.14 venv (3.14 built from source; Debian only ships 3.11) |
+| `/opt/sdk-test-dbs/jars` | `cubrid_jdbc.jar` and `h2.jar`, copied out of the containers by `seed_all.sh` (JDBC seeders and connectors use them) |
+| `/opt/sdk-test-dbs/sqlhosts` | Mimer client SQLHOSTS file (`MIMER_SQLHOSTS`), written by `seed_all.sh` |
 | `/mnt/data/<service>` | Container data (500GB SSD) |
 
 ## GCP Test Infrastructure
@@ -68,7 +70,7 @@ gcloud config set project internal-sales
 |----------|-------|--------|
 | InterSystems IRIS Community | 1972, portal 52773 | Running |
 | Exasol | 8563 (unencrypted — used by seeder and connector), 9563 (TLS) | Running |
-| Apache Geode | 10334 locator / 40404 server / 7070 locator HTTP / 8081 dev REST (pending, see below) | Running |
+| Apache Geode | 10334 locator / 40404 server / 7070 locator HTTP / 8081 dev REST | Running |
 | CUBRID | 33000 | Running |
 | Mimer SQL | 1360 | Running |
 | H2 | 9092 TCP, 8082 web console | Running |
@@ -96,20 +98,24 @@ sudo bash /opt/sdk-test-dbs/connectors/seed_all.sh iris cubrid   # any subset; n
   source /opt/sdk-test-dbs/venv/bin/activate
   python /opt/sdk-test-dbs/connectors/seed_data.py --db h2 --host localhost --customers 1000 --orders 10000
   ```
-- Only Exasol truncates before loading. The other SQL seeders have primary keys, so after a partial failure truncate the tables before re-running.
+- Every seeder clears its tables/regions before loading, so re-running after a partial failure is safe (a failed run on a big load can take a while to clear).
 
-### Seeding status (2026-11-20)
+### Seeding status (2026-11-21)
 
-| DB | Status | Notes |
-|----|--------|-------|
-| Exasol | Seeded, **probably twice** | It ran twice before the TRUNCATE fix and has no primary key. Re-run `seed_all.sh exasol` to reload cleanly. |
-| IRIS | Failed: Access Denied | The failing run probably used an older `seed_all.sh` with the pre-portal password. Retry first. |
-| CUBRID | Failed: Invalid connection handle | The newest `CUBRID-Python` (9.3.0.2) predates Python 3.14. Options: a separate Python 3.11 venv for CUBRID, or the CUBRID JDBC driver via jaydebeapi (Java is installed for H2). The connection-string fix (`CUBRID:host:33000:testdb:::`) has not run yet. |
-| Mimer | Failed: `libmimerapi.so` not found | `seed_all.sh` copies it from `/usr/lib` or `/usr/local/lib` in the container — unverified; locate it with `docker exec mimer find / -name 'libmimerapi*'`. `CREATE TABLE IF NOT EXISTS` support in Mimer is also unverified. |
-| Geode | Failed: connection refused on 7070 | The dev REST API was moved to 8081 because the locator in the same container owns 7070. Apply the new `geode` command and port mapping from the repo compose to the VM compose file, then `docker compose up -d geode`. Regions are created with gfsh via `docker exec`; the multi-key PUT loader has only been tested against a fake server. |
-| H2 | Failed: EOFException on 9092 | The JDBC URL fix (`jdbc:h2:tcp://host:9092//opt/h2-data/test`) has not run yet. Check that the container's H2 version matches the 2.2.224 client jar; H2 2.x also refuses remote database creation unless started with `-ifNotExists`. |
-| Vertica | Not running | Needs Docker Hub login |
-| VoltDB | Skipped | No free license |
+All six databases are seeded: 1M customers / 10M orders each, except Geode (100K / 1M). Row counts were checked directly in each database.
+
+| DB | Notes |
+|----|-------|
+| Exasol | Reloaded cleanly (truncates first); no duplicate ids. |
+| IRIS | The password contains `@`, so the seeder builds the URL with `sqlalchemy.engine.URL.create` (an f-string URL breaks the sqlalchemy-iris dialect). |
+| CUBRID | CUBRID-Python fails on Python 3.14 ("Invalid connection handle"), so seeder and connector use the JDBC jar via jaydebeapi. The compose `CUBRID_PASSWORD` env var does **not** set the `dba` password; it was empty until set with `csql ... ALTER USER dba PASSWORD ...`. If the container is rebuilt, set it again. |
+| Mimer | The client resolves the database name (`mimerdb`) through an SQLHOSTS file, not host:port. `libmimerapi.so` is a symlink inside the container (copy the real file under `/opt/mimersqlsrv*/lib`). There is no `CREATE TABLE IF NOT EXISTS` (`IF` is reserved), and `SYSADM` has no default databank, so tables live in a `SEEDDB` databank the seeder creates. |
+| Geode | Persistent regions need persistent PDX metadata or every REST write fails with a misleading "Json doc ... invalid" 400. Fixed with `configure pdx --disk-store --read-serialized=true` (stored in cluster config). Do not pass `--bind-address=0.0.0.0` to the locator or server (JGroups rejects it and the container crash-loops). The compose command removes stale `.pid` files so restarts work. |
+| H2 | The `oscarfonts/h2` image listens on 1521 (TCP) and 81 (web) inside the container, so compose maps `9092:1521` and `8082:81`, and runs with `-ifNotExists`. The client jar must match the server (2.1.214). Database name is `test` (relative to the server's baseDir). |
+| Vertica | Not running; needs Docker Hub login |
+| VoltDB | Skipped (no free license); the container crash-loops |
+
+Seeders for IRIS, CUBRID, Mimer, H2 and Geode now clear their tables/regions before loading, so re-runs are safe.
 
 ## Connector Code
 
@@ -122,11 +128,17 @@ One directory per connector in this repo (`<name>/connector.py`, `configuration.
 | exasol | pyexasol | cursor on updated_at | Not yet run against a real DB |
 | voltdb | requests (REST) | cursor on updated_at | SKIPPED |
 | geode | requests (REST, port 8081) | cursor on updated_at | Not yet run against a real DB |
-| cubrid | CUBRID-Python | cursor on updated_at | Not yet run against a real DB |
+| cubrid | jaydebeapi + JPype1 (CUBRID JDBC) | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
 | mimer | mimerpy | cursor on updated_at | Not yet run against a real DB |
-| h2 | jaydebeapi + JPype1 | cursor on updated_at | Not yet run against a real DB |
+| h2 | jaydebeapi + JPype1 | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
 
-`fivetran debug` has so far only been run from cloud sessions, which cannot reach the databases.
+`fivetran debug` has been run on the VM for `cubrid` and `h2` (incremental, from a late cursor); the others have not been run against a real DB yet.
+
+Running `fivetran debug` on the VM:
+- The `fivetran` CLI uses system Python 3.11 and does not install connector requirements. Install JDBC deps without root: `/usr/bin/python3 -m pip install --target ~/connector-deps jaydebeapi JPype1`, then run with `PYTHONPATH=~/connector-deps`.
+- Use a scratch config/state file instead of editing `configuration.json`, so real passwords stay out of the repo. `debug` writes the final checkpoint back to the `--state` file.
+- Seeded data is dated 2022-2024. To test without syncing 11M rows, start from a late cursor, e.g. `{"customers_cursor": "2024-12-30 12:00:00", "orders_cursor": "2024-12-31 12:00:00"}`.
+- The SDK requires `DECIMAL` columns to declare `precision`/`scale` in `schema()` and `UTC_DATETIME` values as ISO 8601 with a zone; other connectors may hit the same errors.
 
 ## Test Scenarios
 
@@ -172,9 +184,8 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 
 ## Next Steps
 
-1. Reload Exasol cleanly, then get IRIS, CUBRID, Mimer, Geode and H2 seeded (see the status table)
-2. Run `fivetran debug` for each connector on the VM against `localhost`
-3. Run the test scenarios against each connector
-4. Get Vertica running (Docker Hub login)
-5. Move credentials out of the repo and rotate them
-6. `fivetran deploy` to a Fivetran workspace for end-to-end testing
+1. Run `fivetran debug` for the remaining connectors (iris, exasol, mimer, geode) on the VM against `localhost`
+2. Run the test scenarios against each connector
+3. Get Vertica running (Docker Hub login)
+4. Move credentials out of the repo and rotate them
+5. `fivetran deploy` to a Fivetran workspace for end-to-end testing

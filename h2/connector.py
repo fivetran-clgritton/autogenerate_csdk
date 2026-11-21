@@ -3,8 +3,9 @@ import os
 import urllib.request
 from fivetran_connector_sdk import Connector, Operations as op, Logging as log
 
-H2_JAR_URL = "https://repo1.maven.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.jar"
-H2_JAR_PATH = os.path.join(os.path.dirname(__file__), "h2.jar")
+# The client jar must match the server version (the oscarfonts/h2 container ships 2.1.214).
+H2_JAR_URL = "https://repo1.maven.org/maven2/com/h2database/h2/2.1.214/h2-2.1.214.jar"
+H2_JAR_PATH = os.path.join(os.path.dirname(__file__), "h2-2.1.214.jar")
 
 TABLES = {
     "customers": {
@@ -22,13 +23,13 @@ TABLES = {
 BATCH_SIZE = 10_000
 
 
-def _ensure_jar():
-    """Download H2 JAR if not present (also checks Docker image location)."""
-    docker_jar = "/opt/h2-data/h2.jar"
-    if os.path.exists(docker_jar):
-        return docker_jar
+def _ensure_jar(configuration):
+    """Use the configured jar, else the copy seed_all.sh extracts from the container, else download."""
+    for jar in (configuration.get("h2_jar"), os.environ.get("H2_JAR"), "/opt/sdk-test-dbs/jars/h2.jar"):
+        if jar and os.path.exists(jar):
+            return jar
     if not os.path.exists(H2_JAR_PATH):
-        log.info(f"Downloading H2 JAR from Maven...")
+        log.info("Downloading H2 JAR from Maven...")
         urllib.request.urlretrieve(H2_JAR_URL, H2_JAR_PATH)
         log.info("H2 JAR downloaded.")
     return H2_JAR_PATH
@@ -37,10 +38,10 @@ def _ensure_jar():
 def _connect(configuration):
     host = configuration["host"]
     port = configuration.get("port", "9092")
-    database = configuration.get("database", "~/test")
+    database = configuration.get("database", "test")
     username = configuration.get("username", "sa")
     password = configuration.get("password", "")
-    jar = _ensure_jar()
+    jar = _ensure_jar(configuration)
     jdbc_url = f"jdbc:h2:tcp://{host}:{port}/{database}"
     return jaydebeapi.connect(
         "org.h2.Driver",
@@ -74,7 +75,7 @@ def update(configuration, state):
             if last_cursor:
                 sql = (
                     f"SELECT {', '.join(meta['columns'])} FROM {table.upper()} "
-                    f"WHERE {cursor_col} > PARSEDATETIME('{last_cursor}', 'yyyy-MM-dd HH:mm:ss') "
+                    f"WHERE {cursor_col} > CAST(? AS TIMESTAMP) "
                     f"ORDER BY {cursor_col}"
                 )
                 log.info(f"{table}: incremental from {last_cursor}")
@@ -85,7 +86,7 @@ def update(configuration, state):
                 )
                 log.info(f"{table}: full initial sync")
 
-            cursor.execute(sql)
+            cursor.execute(sql, (last_cursor,)) if last_cursor else cursor.execute(sql)
             cols = meta["columns"]
             new_cursor = last_cursor
             row_count = 0

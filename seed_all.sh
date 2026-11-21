@@ -27,23 +27,54 @@ if wants h2 && ! command -v java &>/dev/null; then
     apt-get install -y --no-install-recommends default-jre-headless
 fi
 
-# mimerpy needs the native client library, which only ships inside the Mimer container
+JARS=$ROOT/jars
+mkdir -p "$JARS"
+
+# mimerpy needs the native client library, which only ships inside the Mimer container.
+# /usr/lib64/libmimerapi.so there is a symlink, and docker cp would copy the dangling link,
+# so resolve it to the real file first.
 MIMER_LIB=/usr/local/lib/libmimerapi.so
-if wants mimer && [ ! -f "$MIMER_LIB" ]; then
+if wants mimer && [ ! -s "$MIMER_LIB" ]; then
     echo "Extracting Mimer native lib from container..."
     MIMER_CTR=$(docker ps --filter name=mimer --format '{{.ID}}' | head -1)
     if [ -n "$MIMER_CTR" ]; then
-        docker cp "$MIMER_CTR":/usr/lib/libmimerapi.so "$MIMER_LIB" 2>/dev/null || \
-        docker cp "$MIMER_CTR":/usr/local/lib/libmimerapi.so "$MIMER_LIB" 2>/dev/null || \
-        echo "WARNING: could not find libmimerapi.so inside the Mimer container — Mimer seeding will fail"
+        REAL=$(docker exec "$MIMER_CTR" readlink -f /usr/lib64/libmimerapi.so 2>/dev/null)
+        docker cp "$MIMER_CTR:${REAL:-/usr/lib64/libmimerapi.so}" "$MIMER_LIB" 2>/dev/null || \
+        echo "WARNING: could not copy libmimerapi.so from the Mimer container - Mimer seeding will fail"
         ldconfig 2>/dev/null || true
     else
-        echo "WARNING: Mimer container not running — skipping lib extraction"
+        echo "WARNING: Mimer container not running - skipping lib extraction"
     fi
+fi
+if wants mimer; then
+    # The Mimer client resolves the database name through an SQLHOSTS file, not host:port.
+    cat > "$ROOT/sqlhosts" <<EOF_SQLHOSTS
+DEFAULT:
+   mimerdb
+REMOTE:
+   mimerdb    localhost    ''    ''    1360
+EOF_SQLHOSTS
+    export MIMER_SQLHOSTS="$ROOT/sqlhosts"
+fi
+
+# CUBRID-Python doesn't work on Python 3.14, so CUBRID and H2 are seeded over JDBC.
+# The jars are copied out of the containers so they always match the server version.
+if wants cubrid; then
+    CUBRID_CTR=$(docker ps --filter name=cubrid --format '{{.ID}}' | head -1)
+    REAL=$(docker exec "$CUBRID_CTR" readlink -f /home/cubrid/CUBRID/jdbc/cubrid_jdbc.jar 2>/dev/null)
+    docker cp "$CUBRID_CTR:${REAL:-/home/cubrid/CUBRID/jdbc/cubrid_jdbc.jar}" "$JARS/cubrid_jdbc.jar" \
+        || echo "WARNING: could not copy the CUBRID JDBC jar - CUBRID seeding will fail"
+    export CUBRID_JDBC_JAR="$JARS/cubrid_jdbc.jar"
+fi
+if wants h2; then
+    H2_CTR=$(docker ps --filter name=h2 --format '{{.ID}}' | head -1)
+    H2_REAL=$(docker exec "$H2_CTR" sh -c 'ls /opt/h2/bin/h2-*.jar | head -1' 2>/dev/null)
+    docker cp "$H2_CTR:$H2_REAL" "$JARS/h2.jar" \
+        || echo "WARNING: could not copy the H2 jar - H2 seeding will fail"
+    export H2_JAR="$JARS/h2.jar"
 fi
 
 source "$ROOT/venv/bin/activate"
-wants cubrid && pip install --quiet CUBRID-Python 2>&1 | tail -3
 wants mimer && pip install --quiet mimerpy 2>&1 | tail -3
 
 UP=""
