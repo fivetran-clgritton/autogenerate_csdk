@@ -9,13 +9,15 @@ One directory per connector, each with `connector.py`, `configuration.json` and 
 | Connector | Driver | Sync strategy | Status |
 |-----------|--------|---------------|--------|
 | `vertica` | vertica-python | cursor on `updated_at` | Not yet tested (no test instance running; likely needs the same SDK-API fixes as the others) |
-| `iris` | sqlalchemy-iris | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
-| `exasol` | pyexasol | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
-| `geode` | requests (dev REST API + OQL) | cursor on `updated_at` | Incremental and full initial sync verified with `fivetran debug` |
-| `mimer` | mimerpy | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
-| `cubrid` | jaydebeapi + JPype1 (JDBC) | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
-| `h2` | jaydebeapi + JPype1 (JDBC) | cursor on `updated_at` | Incremental sync verified with `fivetran debug` |
+| `iris` | sqlalchemy-iris | cursor on `updated_at` | Smoke-tested (small incremental sync only) |
+| `exasol` | pyexasol | cursor on `updated_at` | Smoke-tested (small incremental sync only) |
+| `geode` | requests (dev REST API + OQL) | cursor on `updated_at` | Smoke-tested (small incremental sync and one full initial sync) |
+| `mimer` | mimerpy | cursor on `updated_at` | Smoke-tested (small incremental sync only) |
+| `cubrid` | jaydebeapi + JPype1 (JDBC) | cursor on `updated_at` | Smoke-tested (small incremental sync only) |
+| `h2` | jaydebeapi + JPype1 (JDBC) | cursor on `updated_at` | Smoke-tested (small incremental sync only) |
 | `voltdb` | requests (REST) | cursor on `updated_at` | Skipped (the free image needs a license file) |
+
+"Smoke-tested" means the connector ran a small incremental sync under `fivetran debug` with row counts matching the source. Full-volume syncs, deletes, schema drift and failure recovery are not tested yet (see `test_scenarios.sql`).
 
 All connectors sync two tables, `customers` and `orders`, incrementally using an `updated_at` cursor.
 

@@ -124,15 +124,17 @@ One directory per connector in this repo (`<name>/connector.py`, `configuration.
 | Connector | Driver | Sync strategy | Status |
 |-----------|--------|---------------|--------|
 | vertica | vertica-python | cursor on updated_at | Not yet run against a real DB |
-| iris | sqlalchemy-iris | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
-| exasol | pyexasol | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
+| iris | sqlalchemy-iris | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
+| exasol | pyexasol | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
 | voltdb | requests (REST) | cursor on updated_at | SKIPPED |
-| geode | requests (REST + OQL, port 8081) | cursor on updated_at | Incremental and full initial sync verified on the VM (2026-11-21) |
-| cubrid | jaydebeapi + JPype1 (CUBRID JDBC) | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
-| mimer | mimerpy | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
-| h2 | jaydebeapi + JPype1 | cursor on updated_at | Incremental sync verified on the VM (2026-11-21) |
+| geode | requests (REST + OQL, port 8081) | cursor on updated_at | Smoke-tested: small incremental sync + one full initial sync, row counts match (2026-11-21) |
+| cubrid | jaydebeapi + JPype1 (CUBRID JDBC) | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
+| mimer | mimerpy | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
+| h2 | jaydebeapi + JPype1 | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
 
 `fivetran debug` has been run on the VM for `iris`, `exasol`, `mimer`, `geode`, `cubrid` and `h2` (incremental from a late cursor: 9,989 rows each for the SQL databases; Geode's smaller dataset gives 985). Geode also had a full initial sync (100,000 customers / 1,000,000 orders, about 6 minutes, peak 393 MB). `vertica` has not run (no instance) and `voltdb` is skipped.
+
+**What "smoke-tested" does and does not mean.** Each connector connects, builds its schema and upserts a small slice (rows updated after late Dec 2024) with counts matching the database. Not yet tested for any connector: a full initial sync of the 11M-row tables (only Geode's 1.1M had one), content/type fidelity beyond row counts, resume after a mid-sync failure, deletes, schema drift (schemas are hardcoded), concurrent writes. Do not call a connector "working" until it passes a full initial sync with a content comparison and the test scenarios. Open question: CUBRID's first run reported 9,548 upserts instead of 9,989; not reproducible, cause unknown.
 
 Running `fivetran debug` on the VM:
 - The `fivetran` CLI uses system Python 3.11 and does not install connector requirements. Install JDBC deps without root: `/usr/bin/python3 -m pip install --target ~/connector-deps jaydebeapi JPype1`, then run with `PYTHONPATH=~/connector-deps`.
@@ -188,9 +190,17 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 | `DOCKER_HUB_USER` | Docker Hub username (for pulling `vertica/vertica-ce`) |
 | `DOCKER_HUB_TOKEN` | Docker Hub personal access token |
 
+## Handoff / current state (2026-11-21)
+
+- Work is on branch `fix-db-seeding` (pushed; 2 commits on top of `main`). **The PR is not open yet**: the GitHub token on the VM can push but lacks Pull requests write. Open it at https://github.com/fivetran-clgritton/autogenerate_csdk/pull/new/fix-db-seeding. `seed_all.sh` resets to `origin/main`, so use `SEED_SKIP_UPDATE=1` until it is merged.
+- VM state outside the repo: `gh` installed and logged in; git identity set in this checkout; JDBC/driver deps for `fivetran debug` in `~/connector-deps` (use `PYTHONPATH=~/connector-deps`); VM compose backup at `/opt/sdk-test-dbs/docker-compose.yml.bak-20261120233821`; Geode PDX persistence configured in its cluster config; Mimer `SEEDDB` databank created; CUBRID `dba` password set.
+- Scratch `fivetran debug` config/state files lived in the previous session's scratchpad and are gone. Recreate them from the password table above, outside the repo. Geode state is `{"<region>": {"last_updated_at": "<ISO ts>"}}`, Exasol `{"<table>": {"updated_at": "..."}}`, the rest `{"<table>_cursor": "..."}`. Mimer also needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts`.
+- Two GitHub PATs were pasted into the previous session's transcript; the user was asked to revoke them.
+
 ## Next Steps
 
-1. Run the test scenarios against each working connector (iris, exasol, mimer, geode, cubrid, h2)
-2. Get Vertica running (Docker Hub login), then port its connector to the current SDK API and debug it
-3. Move credentials out of the repo and rotate them
-4. `fivetran deploy` to a Fivetran workspace for end-to-end testing
+1. Full initial sync per connector (one at a time; the 10M-row orders table is where memory/speed problems will show), with a content comparison against the source, not just counts
+2. Run the 12 test scenarios against each connector (7, 11 and 12 exercise the `>=` cursor change)
+3. Get Vertica running (Docker Hub login), then port its connector to the current SDK API (it uses the same nonexistent APIs the others did)
+4. Move credentials out of the repo and rotate them
+5. `fivetran deploy` to a Fivetran workspace for end-to-end testing
