@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import requests
 from fivetran_connector_sdk import Connector, Operations as op, Logging as log
 
@@ -110,6 +112,8 @@ def _get_page(api_key: str, endpoint: str, params: dict) -> dict:
 
 def _sync_shipments(api_key: str, state: dict):
     start_datetime = state.get("shipments_start_datetime", "2010-01-01T00:00:00Z")
+    # Without an explicit end_datetime the API silently limits the window to ~30 days.
+    end_datetime = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     before_id = None
     total = 0
 
@@ -117,6 +121,7 @@ def _sync_shipments(api_key: str, state: dict):
         params = {
             "page_size": PAGE_SIZE,
             "start_datetime": start_datetime,
+            "end_datetime": end_datetime,
         }
         if before_id:
             params["before_id"] = before_id
@@ -212,6 +217,45 @@ def _sync_trackers(api_key: str, state: dict):
     return latest
 
 
+def _sync_addresses(api_key: str):
+    before_id = None
+    total = 0
+
+    while True:
+        params = {"page_size": PAGE_SIZE}
+        if before_id:
+            params["before_id"] = before_id
+
+        data = _get_page(api_key, "addresses", params)
+        addresses = data.get("addresses", [])
+        if not addresses:
+            break
+
+        for a in addresses:
+            yield op.upsert("addresses", {
+                "id": a.get("id"),
+                "name": a.get("name"),
+                "company": a.get("company"),
+                "street1": a.get("street1"),
+                "street2": a.get("street2"),
+                "city": a.get("city"),
+                "state": a.get("state"),
+                "zip": a.get("zip"),
+                "country": a.get("country"),
+                "phone": a.get("phone"),
+                "email": a.get("email"),
+                "created_at": a.get("created_at"),
+                "updated_at": a.get("updated_at"),
+            })
+
+        total += len(addresses)
+        log.info(f"Synced {total} addresses")
+
+        if not data.get("has_more", len(addresses) >= PAGE_SIZE):
+            break
+        before_id = addresses[-1]["id"]
+
+
 def _sync_refunds(api_key: str, state: dict):
     before_id = None
     total = 0
@@ -250,6 +294,7 @@ def update(configuration: dict, state: dict):
 
     yield from _sync_shipments(api_key, state)
     latest_tracker_ts = yield from _sync_trackers(api_key, state)
+    yield from _sync_addresses(api_key)
     yield from _sync_refunds(api_key, state)
 
     new_state = dict(state)
