@@ -13,7 +13,7 @@ import time
 import requests
 
 # Import required classes from fivetran_connector_sdk
-from fivetran_connector_sdk import Connector
+from fivetran_connector_sdk import Connector, ConfigurationForm, Test, form_field
 
 # For enabling Logs in your connector code
 from fivetran_connector_sdk import Logging as log
@@ -130,6 +130,48 @@ def validate_configuration(configuration: dict):
             raise ValueError(f"Missing required configuration value: {key}")
 
 
+def connection_test(configuration: dict):
+    """
+    Setup test that checks the access token with a minimal account query, without retries.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Returns:
+        A success or failure Test result shown on the Fivetran setup page.
+    """
+    test = Test()
+    try:
+        validate_configuration(configuration=configuration)
+        make_request(
+            configuration["access_token"], "query { account { id name } }", {}, max_retries=1
+        )
+    except (ValueError, RuntimeError) as error:
+        return test.failure(str(error))
+    return test.success()
+
+
+def configuration_form():
+    """
+    Declare the setup form Fivetran renders for this connector, and its setup test.
+    Returns:
+        A ConfigurationForm with one field per configuration key and one setup test.
+    """
+    form = ConfigurationForm()
+    form.add_field(
+        form_field.TextField(
+            "access_token",
+            label="Jobber access token",
+            required=True,
+            field_type=form_field.TextField.password,
+            description=(
+                "OAuth access token for your Jobber app. Create the app at "
+                "developer.getjobber.com and complete the OAuth flow to get one."
+            ),
+        )
+    )
+    form.add_test(label="Check the access token against Jobber", func=connection_test)
+    return form
+
+
 def schema(configuration: dict):
     """
     Define the schema function which lets you configure the schema your connector delivers.
@@ -199,7 +241,7 @@ def is_throttled(errors: list):
     return False
 
 
-def make_request(access_token: str, query: str, variables: dict):
+def make_request(access_token: str, query: str, variables: dict, max_retries: int = __MAX_RETRIES):
     """
     Send a GraphQL query to the Jobber API, retrying transient failures with exponential backoff.
     Retries network errors, HTTP 429 and 5xx, and GraphQL throttling errors.
@@ -207,6 +249,7 @@ def make_request(access_token: str, query: str, variables: dict):
         access_token: the Jobber OAuth access token.
         query: the GraphQL query text.
         variables: the GraphQL query variables.
+        max_retries: how many attempts to make before giving up.
     Returns:
         The `data` object of the GraphQL response.
     Raises:
@@ -214,7 +257,7 @@ def make_request(access_token: str, query: str, variables: dict):
             errors, or when retries are exhausted.
     """
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    for attempt in range(__MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             response = requests.post(
                 __GRAPHQL_URL,
@@ -223,7 +266,7 @@ def make_request(access_token: str, query: str, variables: dict):
                 timeout=__REQUEST_TIMEOUT_SECONDS,
             )
         except (requests.ConnectionError, requests.Timeout) as error:
-            if attempt == __MAX_RETRIES - 1:
+            if attempt == max_retries - 1:
                 raise RuntimeError(f"Jobber request failed after retries: {error}") from error
             delay = __BACKOFF_BASE_SECONDS**attempt
             log.warning(f"Network error, retrying in {delay}s: {error}")
@@ -255,7 +298,7 @@ def make_request(access_token: str, query: str, variables: dict):
                 continue
             raise RuntimeError(f"Jobber GraphQL errors: {errors}")
         return body["data"]
-    raise RuntimeError(f"Jobber request still failing after {__MAX_RETRIES} retries")
+    raise RuntimeError(f"Jobber request still failing after {max_retries} attempts")
 
 
 def address_string(address: dict):
@@ -450,7 +493,7 @@ def update(configuration: dict, state: dict):
 
 
 # Create the connector object using the schema and update functions
-connector = Connector(update=update, schema=schema)
+connector = Connector(update=update, schema=schema, configuration_form=configuration_form)
 
 # Check if the script is being run as the main module.
 # This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.

@@ -12,6 +12,8 @@ Syncs clients, jobs, quotes, invoices and expenses from the [Jobber GraphQL API]
 
 Keep real tokens out of version control. `configuration.json` is gitignored in the main repository.
 
+The connector defines a setup form, so the token can be entered in the Fivetran dashboard instead. A setup test checks the token with a minimal account query when the connection is saved. Locally, `fivetran configuration` collects the values and `fivetran configuration --test` runs the setup test.
+
 ## Tables
 
 | Table | Primary key | Sync |
