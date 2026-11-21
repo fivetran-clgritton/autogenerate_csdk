@@ -1,39 +1,128 @@
-import requests
-from fivetran_connector_sdk import Connector, Operations as op, Logging as log
+# Built using Connector SDK AI Plugin
+# Plugin: fivetran-connector-sdk (claude-code) | Version: 2026.11.18.3
+"""This connector syncs learning data from the Degreed API (v2): users, completions, learning
+paths, skills, user skills and content. It authenticates with OAuth 2.0 client credentials.
+See the Technical Reference documentation (https://fivetran.com/docs/connector-sdk/technical-reference)
+and the Best Practices documentation (https://fivetran.com/docs/connector-sdk#connectordevelopmentbestpractices) for details
+"""
 
-REGION_URLS = {
+# For adding a delay between retries
+import time
+
+# For parsing the cursor out of a pagination link
+import urllib.parse
+
+# For making API requests
+import requests
+
+# Import required classes from fivetran_connector_sdk
+from fivetran_connector_sdk import Connector
+
+# For enabling Logs in your connector code
+from fivetran_connector_sdk import Logging as log
+
+# For supporting Data operations like upsert() and checkpoint()
+from fivetran_connector_sdk import Operations as op
+
+__REGION_URLS = {
     "us": "https://degreed.com",
     "eu": "https://eu.degreed.com",
     "ca": "https://ca.degreed.com",
 }
-PAGE_LIMIT = 100
+__DEFAULT_REGION = "us"
+__PAGE_LIMIT = 100
+__MAX_RETRIES = 5
+__BACKOFF_BASE_SECONDS = 2
+__REQUEST_TIMEOUT_SECONDS = 30
+__DEFAULT_START_DATE = "2010-01-01"
+
+# Column -> source attribute names. Degreed returns JSON:API records (an id plus attributes);
+# the first attribute name that has a value is used, so camelCase and snake_case both work.
+__USERS_FIELDS = {
+    "email": ("email",),
+    "first_name": ("firstName", "first_name"),
+    "last_name": ("lastName", "last_name"),
+    "profile_visibility": ("profileVisibility", "profile_visibility"),
+    "role": ("role",),
+    "restricted": ("restricted",),
+    "created_at": ("createdAt", "created_at"),
+    "modified_at": ("modifiedAt", "modified_at"),
+}
+__COMPLETIONS_FIELDS = {
+    "user_id": ("userId", "user_id"),
+    "content_id": ("contentId", "content_id"),
+    "content_type": ("contentType", "content_type"),
+    "completed_at": ("completedAt", "completed_at"),
+    "points_earned": ("pointsEarned", "points_earned"),
+    "duration_in_minutes": ("durationInMinutes", "duration_in_minutes"),
+}
+__LEARNING_PATHS_FIELDS = {
+    "title": ("title",),
+    "description": ("description",),
+    "owner_id": ("ownerId", "owner_id"),
+    "created_at": ("createdAt", "created_at"),
+    "modified_at": ("modifiedAt", "modified_at"),
+    "published_at": ("publishedAt", "published_at"),
+}
+__SKILLS_FIELDS = {
+    "name": ("name",),
+    "description": ("description",),
+    "owner_id": ("ownerId", "owner_id"),
+    "created_at": ("createdAt", "created_at"),
+}
+__USER_SKILLS_FIELDS = {
+    "user_id": ("userId", "user_id"),
+    "skill_id": ("skillId", "skill_id"),
+    "score": ("score",),
+    "level": ("level",),
+    "evaluated_at": ("evaluatedAt", "evaluated_at"),
+}
+__CONTENT_FIELDS = {
+    "title": ("title",),
+    "content_type": ("contentType", "content_type"),
+    "provider": ("provider",),
+    "url": ("url",),
+    "duration_in_minutes": ("durationInMinutes", "duration_in_minutes"),
+    "language": ("language",),
+    "obsolete": ("obsolete",),
+}
+
+
+def validate_configuration(configuration: dict):
+    """
+    Validate the configuration dictionary to ensure it contains all required parameters.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Raises:
+        ValueError: if a required value is missing or the region is not supported.
+    """
+    for key in ["client_id", "client_secret"]:
+        if not configuration.get(key):
+            raise ValueError(f"Missing required configuration value: {key}")
+    region = configuration.get("region") or __DEFAULT_REGION
+    if region not in __REGION_URLS:
+        raise ValueError(f"Unsupported region '{region}'. Use one of: {', '.join(__REGION_URLS)}")
 
 
 def schema(configuration: dict):
+    """
+    Define the schema function which lets you configure the schema your connector delivers.
+    Only primary keys and the columns whose type must be forced are declared, so the SDK infers the rest.
+    See the technical reference documentation for more details on the schema function:
+    https://fivetran.com/docs/connector-sdk/technical-reference/connector-sdk-methods#schema
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    """
     return [
         {
             "table": "users",
             "primary_key": ["id"],
-            "columns": {
-                "id": "STRING",
-                "email": "STRING",
-                "first_name": "STRING",
-                "last_name": "STRING",
-                "profile_visibility": "STRING",
-                "role": "STRING",
-                "restricted": "BOOLEAN",
-                "created_at": "UTC_DATETIME",
-                "modified_at": "UTC_DATETIME",
-            },
+            "columns": {"created_at": "UTC_DATETIME", "modified_at": "UTC_DATETIME"},
         },
         {
             "table": "completions",
             "primary_key": ["id"],
             "columns": {
-                "id": "STRING",
-                "user_id": "STRING",
-                "content_id": "STRING",
-                "content_type": "STRING",
                 "completed_at": "UTC_DATETIME",
                 "points_earned": "FLOAT",
                 "duration_in_minutes": "FLOAT",
@@ -43,10 +132,6 @@ def schema(configuration: dict):
             "table": "learning_paths",
             "primary_key": ["id"],
             "columns": {
-                "id": "STRING",
-                "title": "STRING",
-                "description": "STRING",
-                "owner_id": "STRING",
                 "created_at": "UTC_DATETIME",
                 "modified_at": "UTC_DATETIME",
                 "published_at": "UTC_DATETIME",
@@ -55,271 +140,245 @@ def schema(configuration: dict):
         {
             "table": "skills",
             "primary_key": ["id"],
-            "columns": {
-                "id": "STRING",
-                "name": "STRING",
-                "description": "STRING",
-                "owner_id": "STRING",
-                "created_at": "UTC_DATETIME",
-            },
+            "columns": {"created_at": "UTC_DATETIME"},
         },
         {
             "table": "user_skills",
             "primary_key": ["user_id", "skill_id"],
-            "columns": {
-                "user_id": "STRING",
-                "skill_id": "STRING",
-                "score": "FLOAT",
-                "level": "STRING",
-                "evaluated_at": "UTC_DATETIME",
-            },
+            "columns": {"score": "FLOAT", "evaluated_at": "UTC_DATETIME"},
         },
         {
             "table": "content",
             "primary_key": ["id"],
-            "columns": {
-                "id": "STRING",
-                "title": "STRING",
-                "content_type": "STRING",
-                "provider": "STRING",
-                "url": "STRING",
-                "duration_in_minutes": "FLOAT",
-                "language": "STRING",
-                "obsolete": "BOOLEAN",
-            },
+            "columns": {"duration_in_minutes": "FLOAT"},
         },
     ]
 
 
-def _get_token(base_url: str, client_id: str, client_secret: str) -> str:
-    resp = requests.post(
-        f"{base_url}/oauth/token",
+def send_request(method: str, url: str, **kwargs):
+    """
+    Send an HTTP request, retrying network errors, HTTP 429 and 5xx with exponential backoff.
+    Any other status, including 401, is returned to the caller to handle.
+    Args:
+        method: the HTTP method.
+        url: the full request URL.
+        kwargs: extra arguments passed to requests.request (headers, params, data).
+    Returns:
+        The requests.Response object.
+    Raises:
+        RuntimeError: when the request still fails after all retries.
+    """
+    for attempt in range(__MAX_RETRIES):
+        try:
+            response = requests.request(method, url, timeout=__REQUEST_TIMEOUT_SECONDS, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as error:
+            if attempt == __MAX_RETRIES - 1:
+                raise RuntimeError(f"Degreed request failed after retries: {error}") from error
+            delay = __BACKOFF_BASE_SECONDS**attempt
+            log.warning(f"Network error, retrying in {delay}s: {error}")
+            time.sleep(delay)
+            continue
+
+        if response.status_code == 429 or response.status_code >= 500:
+            # Honor Retry-After when the API sends it, otherwise back off exponentially.
+            retry_after = response.headers.get("Retry-After", "")
+            delay = int(retry_after) if retry_after.isdigit() else __BACKOFF_BASE_SECONDS**attempt
+            log.warning(f"HTTP {response.status_code} from Degreed, retrying in {delay}s")
+            time.sleep(delay)
+            continue
+        return response
+    raise RuntimeError(f"Degreed request still failing after {__MAX_RETRIES} retries")
+
+
+def get_token(auth: dict):
+    """
+    Request an OAuth 2.0 access token with the client credentials grant and cache it in auth.
+    Args:
+        auth: dictionary holding base_url, client_id, client_secret and the cached token.
+    Raises:
+        RuntimeError: if Degreed rejects the credentials.
+    """
+    response = send_request(
+        "POST",
+        f"{auth['base_url']}/oauth/token",
         data={
             "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
+            "client_id": auth["client_id"],
+            "client_secret": auth["client_secret"],
         },
-        timeout=30,
     )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+    if not response.ok:
+        raise RuntimeError(
+            f"Degreed rejected the client credentials (HTTP {response.status_code}). "
+            "Check client_id, client_secret and region."
+        )
+    auth["token"] = response.json()["access_token"]
 
 
-def _headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}"}
+def api_get(auth: dict, path: str, params: dict):
+    """
+    GET an endpoint under /api/v2 with the cached token, refreshing the token once on a 401.
+    Args:
+        auth: dictionary holding base_url, client_id, client_secret and the cached token.
+        path: the endpoint path, such as "users".
+        params: query parameters.
+    Returns:
+        The parsed JSON response body.
+    Raises:
+        RuntimeError: on authentication failures or other non-successful responses.
+    """
+    url = f"{auth['base_url']}/api/v2/{path}"
+    response = send_request("GET", url, headers={"Authorization": f"Bearer {auth['token']}"}, params=params)
+    if response.status_code == 401:
+        log.info("Access token rejected, requesting a new one")
+        get_token(auth)
+        response = send_request("GET", url, headers={"Authorization": f"Bearer {auth['token']}"}, params=params)
+    if response.status_code in (401, 403):
+        raise RuntimeError(f"Degreed denied access to {path} (HTTP {response.status_code}). Check API permissions.")
+    if not response.ok:
+        raise RuntimeError(f"Degreed request to {path} failed: HTTP {response.status_code}")
+    return response.json()
 
 
-def _get_page(base_url: str, token: str, path: str, params: dict) -> dict:
-    resp = requests.get(
-        f"{base_url}/api/v2/{path}",
-        headers=_headers(token),
-        params=params,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def attribute(record: dict, names: tuple):
+    """
+    Read a JSON:API attribute, falling back to the plain record when there is no attributes object.
+    Args:
+        record: one record from the API response.
+        names: candidate attribute names, in priority order.
+    Returns:
+        The first value that is not None, or None.
+    """
+    attributes = record.get("attributes", record)
+    for name in names:
+        value = attributes.get(name)
+        if value is not None:
+            return value
+    return None
 
 
-def _attr(record: dict, key: str):
-    """Degreed API returns JSON:API format: data[].attributes + data[].id"""
-    attrs = record.get("attributes", record)
-    return attrs.get(key)
+def next_cursor(links: dict):
+    """
+    Extract the pagination cursor from the "next" link, which may be a full URL or a bare cursor.
+    Args:
+        links: the links object of an API response.
+    Returns:
+        The cursor value, or None when there is no next page.
+    """
+    link = links.get("next")
+    if not link:
+        return None
+    if "next=" in str(link):
+        query = urllib.parse.urlparse(link).query
+        return urllib.parse.parse_qs(query).get("next", [None])[0]
+    return link
+
+
+def sync_endpoint(auth: dict, path: str, table: str, fields: dict, with_id: bool = True,
+                  params: dict = None, track_column: str = None):
+    """
+    Page through an endpoint and upsert every record, writing each page as it arrives.
+    Args:
+        auth: dictionary holding base_url, client_id, client_secret and the cached token.
+        path: the endpoint path under /api/v2.
+        table: the destination table.
+        fields: column -> source attribute names mapping for the table.
+        with_id: whether to copy the record id into the row (false for user_skills, keyed by attributes).
+        params: extra query parameters sent with every page request.
+        track_column: optional column whose maximum value is returned, for incremental state.
+    Returns:
+        The largest value seen in track_column, or None.
+    """
+    cursor = None
+    total = 0
+    latest = None
+    while True:
+        page_params = {"limit": __PAGE_LIMIT, **(params or {})}
+        if cursor:
+            page_params["next"] = cursor
+        records = api_get(auth, path, page_params)
+        page = records.get("data", [])
+        if not page:
+            break
+
+        for record in page:
+            row = {"id": record.get("id")} if with_id else {}
+            for column, names in fields.items():
+                row[column] = attribute(record, names)
+            # The 'upsert' operation inserts or updates a row by primary key.
+            op.upsert(table=table, data=row)
+            tracked = row.get(track_column) if track_column else None
+            if tracked and (latest is None or tracked > latest):
+                latest = tracked
+
+        total += len(page)
+        log.info(f"{table}: synced {total} records so far")
+
+        cursor = next_cursor(records.get("links", {}))
+        if not cursor or len(page) < __PAGE_LIMIT:
+            break
+    return latest
 
 
 def update(configuration: dict, state: dict):
-    region = configuration.get("region", "us")
-    base_url = REGION_URLS.get(region, REGION_URLS["us"])
-    client_id = configuration["client_id"]
-    client_secret = configuration["client_secret"]
+    """
+    Define the update function, which is called by Fivetran during each sync.
+    See the technical reference documentation for more details on the update function
+    https://fivetran.com/docs/connector-sdk/technical-reference/connector-sdk-methods#update
+    Args:
+        configuration: A dictionary containing connection details
+        state: A dictionary containing state information from previous runs
+        The state dictionary is empty for the first sync or for any full re-sync
+    """
+    validate_configuration(configuration=configuration)
 
-    token = _get_token(base_url, client_id, client_secret)
+    region = configuration.get("region") or __DEFAULT_REGION
+    auth = {
+        "base_url": __REGION_URLS[region],
+        "client_id": configuration["client_id"],
+        "client_secret": configuration["client_secret"],
+        "token": None,
+    }
+    get_token(auth)
 
-    # --- Users (cursor-based incremental) ---
-    log.info("Syncing users")
-    cursor = state.get("users_cursor")
-    while True:
-        params = {"limit": PAGE_LIMIT}
-        if cursor:
-            params["next"] = cursor
-        data = _get_page(base_url, token, "users", params)
-        records = data.get("data", [])
-        if not records:
-            break
-        for r in records:
-            rid = r.get("id")
-            yield op.upsert("users", {
-                "id": rid,
-                "email": _attr(r, "email"),
-                "first_name": _attr(r, "firstName") or _attr(r, "first_name"),
-                "last_name": _attr(r, "lastName") or _attr(r, "last_name"),
-                "profile_visibility": _attr(r, "profileVisibility") or _attr(r, "profile_visibility"),
-                "role": _attr(r, "role"),
-                "restricted": _attr(r, "restricted"),
-                "created_at": _attr(r, "createdAt") or _attr(r, "created_at"),
-                "modified_at": _attr(r, "modifiedAt") or _attr(r, "modified_at"),
-            })
-        links = data.get("links", {})
-        next_cursor = links.get("next")
-        if not next_cursor or len(records) < PAGE_LIMIT:
-            cursor = None
-            break
-        # Extract cursor value from next URL if it's a full URL
-        if "next=" in str(next_cursor):
-            import urllib.parse
-            parsed = urllib.parse.urlparse(next_cursor)
-            cursor = urllib.parse.parse_qs(parsed.query).get("next", [None])[0]
-        else:
-            cursor = next_cursor
-    yield op.checkpoint(state={**state, "users_cursor": None})
+    # Users: full refresh each sync.
+    sync_endpoint(auth, "users", "users", __USERS_FIELDS)
+    op.checkpoint(state=state)
 
-    # --- Completions (incremental by date window) ---
-    log.info("Syncing completions")
-    completions_since = state.get("completions_since", "2010-01-01")
-    latest_completion = completions_since
-    cursor = None
-    while True:
-        params = {"limit": PAGE_LIMIT, "start_date": completions_since}
-        if cursor:
-            params["next"] = cursor
-        data = _get_page(base_url, token, "completions", params)
-        records = data.get("data", [])
-        if not records:
-            break
-        for r in records:
-            completed_at = _attr(r, "completedAt") or _attr(r, "completed_at") or ""
-            if completed_at and completed_at > latest_completion:
-                latest_completion = completed_at
-            yield op.upsert("completions", {
-                "id": r.get("id"),
-                "user_id": _attr(r, "userId") or _attr(r, "user_id"),
-                "content_id": _attr(r, "contentId") or _attr(r, "content_id"),
-                "content_type": _attr(r, "contentType") or _attr(r, "content_type"),
-                "completed_at": completed_at,
-                "points_earned": _attr(r, "pointsEarned") or _attr(r, "points_earned"),
-                "duration_in_minutes": _attr(r, "durationInMinutes") or _attr(r, "duration_in_minutes"),
-            })
-        links = data.get("links", {})
-        next_cursor = links.get("next")
-        if not next_cursor or len(records) < PAGE_LIMIT:
-            break
-        cursor = next_cursor
-    yield op.checkpoint(state={**state, "completions_since": latest_completion})
+    # Completions: incremental from the latest completed_at, sent as start_date.
+    completions_since = state.get("completions_since", __DEFAULT_START_DATE)
+    latest_completion = sync_endpoint(
+        auth, "completions", "completions", __COMPLETIONS_FIELDS,
+        params={"start_date": completions_since}, track_column="completed_at",
+    )
+    state = {**state, "completions_since": latest_completion or completions_since}
+    op.checkpoint(state=state)
 
-    # --- Learning Paths (full refresh) ---
-    log.info("Syncing learning_paths")
-    cursor = None
-    while True:
-        params = {"limit": PAGE_LIMIT}
-        if cursor:
-            params["next"] = cursor
-        data = _get_page(base_url, token, "pathways", params)
-        records = data.get("data", [])
-        if not records:
-            break
-        for r in records:
-            yield op.upsert("learning_paths", {
-                "id": r.get("id"),
-                "title": _attr(r, "title"),
-                "description": _attr(r, "description"),
-                "owner_id": _attr(r, "ownerId") or _attr(r, "owner_id"),
-                "created_at": _attr(r, "createdAt") or _attr(r, "created_at"),
-                "modified_at": _attr(r, "modifiedAt") or _attr(r, "modified_at"),
-                "published_at": _attr(r, "publishedAt") or _attr(r, "published_at"),
-            })
-        links = data.get("links", {})
-        if not links.get("next") or len(records) < PAGE_LIMIT:
-            break
-        cursor = links["next"]
+    # Learning paths and skills: full refresh each sync.
+    sync_endpoint(auth, "pathways", "learning_paths", __LEARNING_PATHS_FIELDS)
+    sync_endpoint(auth, "skills", "skills", __SKILLS_FIELDS)
 
-    # --- Skills (full refresh) ---
-    log.info("Syncing skills")
-    cursor = None
-    while True:
-        params = {"limit": PAGE_LIMIT}
-        if cursor:
-            params["next"] = cursor
-        data = _get_page(base_url, token, "skills", params)
-        records = data.get("data", [])
-        if not records:
-            break
-        for r in records:
-            yield op.upsert("skills", {
-                "id": r.get("id"),
-                "name": _attr(r, "name"),
-                "description": _attr(r, "description"),
-                "owner_id": _attr(r, "ownerId") or _attr(r, "owner_id"),
-                "created_at": _attr(r, "createdAt") or _attr(r, "created_at"),
-            })
-        links = data.get("links", {})
-        if not links.get("next") or len(records) < PAGE_LIMIT:
-            break
-        cursor = links["next"]
+    # User skills: the latest evaluated_at is tracked in state; the endpoint is read in full each sync.
+    user_skills_since = state.get("user_skills_since", __DEFAULT_START_DATE)
+    latest_evaluation = sync_endpoint(
+        auth, "user-skills", "user_skills", __USER_SKILLS_FIELDS,
+        with_id=False, track_column="evaluated_at",
+    )
+    state = {**state, "user_skills_since": latest_evaluation or user_skills_since}
+    op.checkpoint(state=state)
 
-    # --- User Skills (incremental) ---
-    log.info("Syncing user_skills")
-    user_skills_since = state.get("user_skills_since", "2010-01-01")
-    latest_eval = user_skills_since
-    cursor = None
-    while True:
-        params = {"limit": PAGE_LIMIT}
-        if cursor:
-            params["next"] = cursor
-        data = _get_page(base_url, token, "user-skills", params)
-        records = data.get("data", [])
-        if not records:
-            break
-        for r in records:
-            evaluated_at = _attr(r, "evaluatedAt") or _attr(r, "evaluated_at") or ""
-            if evaluated_at and evaluated_at > latest_eval:
-                latest_eval = evaluated_at
-            yield op.upsert("user_skills", {
-                "user_id": _attr(r, "userId") or _attr(r, "user_id"),
-                "skill_id": _attr(r, "skillId") or _attr(r, "skill_id"),
-                "score": _attr(r, "score"),
-                "level": _attr(r, "level"),
-                "evaluated_at": evaluated_at,
-            })
-        links = data.get("links", {})
-        if not links.get("next") or len(records) < PAGE_LIMIT:
-            break
-        cursor = links["next"]
-    yield op.checkpoint(state={**state, "user_skills_since": latest_eval})
+    # Content: full refresh each sync.
+    sync_endpoint(auth, "content", "content", __CONTENT_FIELDS)
 
-    # --- Content (full refresh) ---
-    log.info("Syncing content")
-    cursor = None
-    while True:
-        params = {"limit": PAGE_LIMIT}
-        if cursor:
-            params["next"] = cursor
-        data = _get_page(base_url, token, "content", params)
-        records = data.get("data", [])
-        if not records:
-            break
-        for r in records:
-            yield op.upsert("content", {
-                "id": r.get("id"),
-                "title": _attr(r, "title"),
-                "content_type": _attr(r, "contentType") or _attr(r, "content_type"),
-                "provider": _attr(r, "provider"),
-                "url": _attr(r, "url"),
-                "duration_in_minutes": _attr(r, "durationInMinutes") or _attr(r, "duration_in_minutes"),
-                "language": _attr(r, "language"),
-                "obsolete": _attr(r, "obsolete"),
-            })
-        links = data.get("links", {})
-        if not links.get("next") or len(records) < PAGE_LIMIT:
-            break
-        cursor = links["next"]
-
-    yield op.checkpoint(state={
-        "users_cursor": None,
-        "completions_since": latest_completion,
-        "user_skills_since": latest_eval,
-    })
+    # Save the progress by checkpointing the state. This is important for ensuring that the sync
+    # process can resume from the correct position in case of next sync or interruptions.
+    op.checkpoint(state=state)
 
 
+# Create the connector object using the schema and update functions
 connector = Connector(update=update, schema=schema)
 
+# Check if the script is being run as the main module.
+# This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.
 if __name__ == "__main__":
     connector.debug()
