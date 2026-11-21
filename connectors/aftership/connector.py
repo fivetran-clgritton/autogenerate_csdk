@@ -83,6 +83,31 @@ def schema(configuration: dict):
             },
         },
         {
+            "table": "estimated_deliveries",
+            "primary_key": ["tracking_id", "source"],
+            "columns": {
+                "tracking_id": "STRING",
+                "source": "STRING",
+                "type": "STRING",
+                "datetime": "UTC_DATETIME",
+                "datetime_min": "UTC_DATETIME",
+                "datetime_max": "UTC_DATETIME",
+                "estimated_delivery_date": "UTC_DATETIME",
+                "estimated_delivery_date_min": "UTC_DATETIME",
+                "estimated_delivery_date_max": "UTC_DATETIME",
+            },
+        },
+        {
+            "table": "next_couriers",
+            "primary_key": ["tracking_id", "slug"],
+            "columns": {
+                "tracking_id": "STRING",
+                "slug": "STRING",
+                "tracking_number": "STRING",
+                "source": "STRING",
+            },
+        },
+        {
             "table": "couriers",
             "primary_key": ["slug"],
             "columns": {
@@ -204,6 +229,37 @@ def _flatten_checkpoint(tracking_id: str, cp: dict) -> dict:
     }
 
 
+def _estimated_delivery_rows(tracking_id: str, t: dict) -> list:
+    rows = []
+    fed = t.get("first_estimated_delivery") or {}
+    if fed:
+        rows.append({
+            "tracking_id": tracking_id,
+            "source": fed.get("source", "first"),
+            "type": fed.get("type"),
+            "datetime": fed.get("datetime"),
+            "datetime_min": fed.get("datetime_min"),
+            "datetime_max": fed.get("datetime_max"),
+            "estimated_delivery_date": None,
+            "estimated_delivery_date_min": None,
+            "estimated_delivery_date_max": None,
+        })
+    ced = t.get("courier_estimated_delivery_date") or {}
+    if ced:
+        rows.append({
+            "tracking_id": tracking_id,
+            "source": "courier",
+            "type": None,
+            "datetime": None,
+            "datetime_min": None,
+            "datetime_max": None,
+            "estimated_delivery_date": ced.get("estimated_delivery_date"),
+            "estimated_delivery_date_min": ced.get("estimated_delivery_date_min"),
+            "estimated_delivery_date_max": ced.get("estimated_delivery_date_max"),
+        })
+    return rows
+
+
 def update(configuration: dict, state: dict):
     api_key = configuration["api_key"]
     # Default to epoch start on first run; AfterShip accepts ISO 8601
@@ -220,10 +276,22 @@ def update(configuration: dict, state: dict):
         trackings = data.get("data", {}).get("trackings", [])
 
         for t in trackings:
+            tid = t["id"]
             yield op.upsert("trackings", _flatten_tracking(t))
 
             for cp in t.get("checkpoints", []):
-                yield op.upsert("checkpoints", _flatten_checkpoint(t["id"], cp))
+                yield op.upsert("checkpoints", _flatten_checkpoint(tid, cp))
+
+            for row in _estimated_delivery_rows(tid, t):
+                yield op.upsert("estimated_deliveries", row)
+
+            for nc in t.get("next_couriers") or []:
+                yield op.upsert("next_couriers", {
+                    "tracking_id": tid,
+                    "slug": nc.get("slug"),
+                    "tracking_number": nc.get("tracking_number"),
+                    "source": nc.get("source"),
+                })
 
             t_updated = t.get("updated_at", "")
             if t_updated and t_updated > latest_updated_at:
