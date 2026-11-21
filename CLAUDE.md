@@ -117,6 +117,23 @@ All six databases are seeded: 1M customers / 10M orders each, except Geode (100K
 
 Seeders for IRIS, CUBRID, Mimer, H2 and Geode now clear their tables/regions before loading, so re-runs are safe.
 
+## Connector Requirements
+
+These are **general connectors** for customers running these databases, not harnesses for the seeded test data. Every connector must meet these requirements (decided 2026-11-21):
+
+1. **Discover tables and columns from the database catalog.** Never hardcode table names, column lists, primary keys or cursor columns. Use the source's catalog: `INFORMATION_SCHEMA` (IRIS, Mimer, H2), `EXA_ALL_TABLES` / `EXA_ALL_COLUMNS` / `EXA_ALL_CONSTRAINT_COLUMNS` (Exasol), `db_class` / `db_attribute` / `db_index` (CUBRID), the region list from the dev REST API (Geode, sampling entries for fields), and so on for new databases.
+2. **Let the user scope the sync.** Configuration should allow selecting schemas and including or excluding tables (flat string values, e.g. comma-separated lists, per the SDK's `configuration.json` rules). Exclude system schemas by default.
+3. **Take primary keys from the catalog.** For a table with no primary key, use the SDK behaviour (no `primary_key`, so Fivetran adds `_fivetran_id`) and say so in a log message.
+4. **Choose a sync strategy per table.**
+   - **Incremental:** when a usable cursor column exists (configurable, defaulting to a convention such as `updated_at`). Read `cursor >= last value` with keyset paging on `(cursor, primary key)`.
+   - **Full reload:** for tables with no usable cursor. Use `op.truncate(table, deferred=True)` and then upsert every row, so a failed sync deletes nothing.
+5. **Use batched queries.** Each batch is its own bounded query (`TOP n` / `LIMIT n` / `FETCH FIRST n`) continuing after the last `(cursor, pk)` delivered. Never rely on a single streamed result set: the IRIS driver grew memory linearly (2.4 GB after 6M rows) with one streamed query and would have hit the 4 GB limit that `fivetran debug` and production enforce.
+6. **Checkpoint on a time cadence:** no more than once a minute and about every 5-10 minutes, plus at the end of each table. A mid-table checkpoint stores the keyset position so a resume is exact.
+7. **Handle schema drift:** pick up new columns and cope with dropped ones without failing the sync. Declare column types only where a type must be forced (e.g. `DECIMAL` precision/scale, `UTC_DATETIME`), so the SDK can infer the rest and evolve the schema.
+8. **Follow the SDK reference** in the `fivetran-connector-sdk` Claude Code plugin (https://github.com/fivetran/connector_sdk_tools, installed on the VM). In particular: call `op.*` directly (never `yield`), run `/evaluate-connector` before calling a connector done, and keep dependencies the Fivetran runtime lacks (Java/JDBC jars, native client libraries) in mind. Those need the SDK's custom-driver mechanism (`drivers/installation.sh`, Private Preview) or a pure-Python driver.
+
+**Current state:** none of the connectors meet requirements 1-4 or 7 yet. They are hardcoded to `customers` / `orders` with `id` / `updated_at` (Geode reads regions from config and samples one entry). IRIS is the first being reworked: it has batched keyset reads and time-based checkpoints (requirements 5 and 6), and its full initial sync is being verified.
+
 ## Connector Code
 
 One directory per connector in this repo (`<name>/connector.py`, `configuration.json`, `requirements.txt`). Set the host in `configuration.json` (`localhost` when running `fivetran debug` on the VM, `35.202.214.246` from elsewhere).
@@ -199,8 +216,9 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 
 ## Next Steps
 
-1. Full initial sync per connector (one at a time; the 10M-row orders table is where memory/speed problems will show), with a content comparison against the source, not just counts
-2. Run the 12 test scenarios against each connector (7, 11 and 12 exercise the `>=` cursor change)
-3. Get Vertica running (Docker Hub login), then port its connector to the current SDK API (it uses the same nonexistent APIs the others did)
-4. Move credentials out of the repo and rotate them
-5. `fivetran deploy` to a Fivetran workspace for end-to-end testing
+1. Make the connectors general (see **Connector Requirements**). Start with IRIS: finish verifying its batched full sync, then add catalog discovery, scoping config and per-table strategy. Use it as the template for Exasol, Mimer, CUBRID and H2, then Geode.
+2. Full initial sync per connector (one at a time; the 10M-row orders table is where memory/speed problems will show), with a content comparison against the source, not just counts
+3. Run the 12 test scenarios against each connector (7, 11 and 12 exercise the `>=` cursor change)
+4. Get Vertica running (Docker Hub login), then port its connector to the current SDK API (it uses the same nonexistent APIs the others did)
+5. Move credentials out of the repo and rotate them
+6. `fivetran deploy` to a Fivetran workspace for end-to-end testing
