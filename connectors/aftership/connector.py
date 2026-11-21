@@ -13,7 +13,7 @@ import time
 import requests
 
 # Import required classes from fivetran_connector_sdk
-from fivetran_connector_sdk import Connector
+from fivetran_connector_sdk import Connector, ConfigurationForm, Test, form_field
 
 # For enabling Logs in your connector code
 from fivetran_connector_sdk import Logging as log
@@ -60,6 +60,43 @@ def validate_configuration(configuration: dict):
     for key in ["api_key"]:
         if not configuration.get(key):
             raise ValueError(f"Missing required configuration value: {key}")
+
+
+def connection_test(configuration: dict):
+    """
+    Setup test that checks the API key with a one-row request to the trackings endpoint.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Returns:
+        A success or failure Test result shown on the Fivetran setup page.
+    """
+    test = Test()
+    try:
+        validate_configuration(configuration=configuration)
+        make_request(configuration["api_key"], "/trackings", {"limit": 1})
+    except (ValueError, RuntimeError) as error:
+        return test.failure(str(error))
+    return test.success()
+
+
+def configuration_form():
+    """
+    Declare the setup form Fivetran renders for this connector, and its setup test.
+    Returns:
+        A ConfigurationForm with one field per configuration key and one setup test.
+    """
+    form = ConfigurationForm()
+    form.add_field(
+        form_field.TextField(
+            "api_key",
+            label="AfterShip API key",
+            required=True,
+            field_type=form_field.TextField.password,
+            description="Create one under Settings, API Keys in the AfterShip dashboard.",
+        )
+    )
+    form.add_test(label="Check the API key against AfterShip", func=connection_test)
+    return form
 
 
 def schema(configuration: dict):
@@ -276,7 +313,7 @@ def update(configuration: dict, state: dict):
 
 
 # Create the connector object using the schema and update functions
-connector = Connector(update=update, schema=schema)
+connector = Connector(update=update, schema=schema, configuration_form=configuration_form)
 
 # Check if the script is being run as the main module.
 # This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.
