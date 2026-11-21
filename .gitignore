@@ -227,3 +227,6 @@ __marimo__/
 
 # Connector credentials (never commit real keys)
 connectors/**/configuration.json
+
+# fivetran debug output
+connectors/**/files/
