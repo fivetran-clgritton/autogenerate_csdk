@@ -16,7 +16,7 @@ import urllib.parse
 import requests
 
 # Import required classes from fivetran_connector_sdk
-from fivetran_connector_sdk import Connector
+from fivetran_connector_sdk import Connector, ConfigurationForm, Test, form_field
 
 # For enabling Logs in your connector code
 from fivetran_connector_sdk import Logging as log
@@ -104,6 +104,74 @@ def validate_configuration(configuration: dict):
         raise ValueError(f"Unsupported region '{region}'. Use one of: {', '.join(__REGION_URLS)}")
 
 
+def connection_test(configuration: dict):
+    """
+    Setup test that fetches an OAuth token and then reads one user, which checks the client
+    credentials, the region and the API permissions. It uses two attempts per request so a bad
+    credential fails within a few seconds.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Returns:
+        A success or failure Test result shown on the Fivetran setup page.
+    """
+    test = Test()
+    try:
+        validate_configuration(configuration=configuration)
+        region = configuration.get("region") or __DEFAULT_REGION
+        auth = {
+            "base_url": __REGION_URLS[region],
+            "client_id": configuration["client_id"],
+            "client_secret": configuration["client_secret"],
+            "token": None,
+        }
+        get_token(auth, max_retries=2)
+        api_get(auth, "users", {"limit": 1}, max_retries=2)
+    except (ValueError, RuntimeError) as error:
+        return test.failure(str(error))
+    return test.success()
+
+
+def configuration_form():
+    """
+    Declare the setup form Fivetran renders for this connector, and its setup test.
+    Returns:
+        A ConfigurationForm with one field per configuration key and one setup test.
+    """
+    form = ConfigurationForm()
+    form.add_field(
+        form_field.TextField(
+            "client_id",
+            label="Degreed client ID",
+            required=True,
+            description="Client ID of the Degreed API credentials.",
+        )
+    )
+    form.add_field(
+        form_field.TextField(
+            "client_secret",
+            label="Degreed client secret",
+            required=True,
+            field_type=form_field.TextField.password,
+            description="Client secret of the same credentials.",
+        )
+    )
+    form.add_field(
+        form_field.DropdownField(
+            "region",
+            label="Region",
+            required=True,
+            description="The Degreed region that hosts your organization.",
+            fields=[
+                form_field.DropdownFieldParam(value="us", label="United States", description="Degreed US host"),
+                form_field.DropdownFieldParam(value="eu", label="Europe", description="Degreed EU host"),
+                form_field.DropdownFieldParam(value="ca", label="Canada", description="Degreed Canada host"),
+            ],
+        )
+    )
+    form.add_test(label="Check the credentials against Degreed", func=connection_test)
+    return form
+
+
 def schema(configuration: dict):
     """
     Define the schema function which lets you configure the schema your connector delivers.
@@ -155,24 +223,25 @@ def schema(configuration: dict):
     ]
 
 
-def send_request(method: str, url: str, **kwargs):
+def send_request(method: str, url: str, max_retries: int = __MAX_RETRIES, **kwargs):
     """
     Send an HTTP request, retrying network errors, HTTP 429 and 5xx with exponential backoff.
     Any other status, including 401, is returned to the caller to handle.
     Args:
         method: the HTTP method.
         url: the full request URL.
+        max_retries: number of attempts before giving up.
         kwargs: extra arguments passed to requests.request (headers, params, data).
     Returns:
         The requests.Response object.
     Raises:
         RuntimeError: when the request still fails after all retries.
     """
-    for attempt in range(__MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             response = requests.request(method, url, timeout=__REQUEST_TIMEOUT_SECONDS, **kwargs)
         except (requests.ConnectionError, requests.Timeout) as error:
-            if attempt == __MAX_RETRIES - 1:
+            if attempt == max_retries - 1:
                 raise RuntimeError(f"Degreed request failed after retries: {error}") from error
             delay = __BACKOFF_BASE_SECONDS**attempt
             log.warning(f"Network error, retrying in {delay}s: {error}")
@@ -187,20 +256,22 @@ def send_request(method: str, url: str, **kwargs):
             time.sleep(delay)
             continue
         return response
-    raise RuntimeError(f"Degreed request still failing after {__MAX_RETRIES} retries")
+    raise RuntimeError(f"Degreed request still failing after {max_retries} retries")
 
 
-def get_token(auth: dict):
+def get_token(auth: dict, max_retries: int = __MAX_RETRIES):
     """
     Request an OAuth 2.0 access token with the client credentials grant and cache it in auth.
     Args:
         auth: dictionary holding base_url, client_id, client_secret and the cached token.
+        max_retries: number of attempts for the token request.
     Raises:
         RuntimeError: if Degreed rejects the credentials.
     """
     response = send_request(
         "POST",
         f"{auth['base_url']}/oauth/token",
+        max_retries=max_retries,
         data={
             "grant_type": "client_credentials",
             "client_id": auth["client_id"],
@@ -215,24 +286,27 @@ def get_token(auth: dict):
     auth["token"] = response.json()["access_token"]
 
 
-def api_get(auth: dict, path: str, params: dict):
+def api_get(auth: dict, path: str, params: dict, max_retries: int = __MAX_RETRIES):
     """
     GET an endpoint under /api/v2 with the cached token, refreshing the token once on a 401.
     Args:
         auth: dictionary holding base_url, client_id, client_secret and the cached token.
         path: the endpoint path, such as "users".
         params: query parameters.
+        max_retries: number of attempts per request.
     Returns:
         The parsed JSON response body.
     Raises:
         RuntimeError: on authentication failures or other non-successful responses.
     """
     url = f"{auth['base_url']}/api/v2/{path}"
-    response = send_request("GET", url, headers={"Authorization": f"Bearer {auth['token']}"}, params=params)
+    headers = {"Authorization": f"Bearer {auth['token']}"}
+    response = send_request("GET", url, max_retries=max_retries, headers=headers, params=params)
     if response.status_code == 401:
         log.info("Access token rejected, requesting a new one")
-        get_token(auth)
-        response = send_request("GET", url, headers={"Authorization": f"Bearer {auth['token']}"}, params=params)
+        get_token(auth, max_retries)
+        headers = {"Authorization": f"Bearer {auth['token']}"}
+        response = send_request("GET", url, max_retries=max_retries, headers=headers, params=params)
     if response.status_code in (401, 403):
         raise RuntimeError(f"Degreed denied access to {path} (HTTP {response.status_code}). Check API permissions.")
     if not response.ok:
@@ -376,7 +450,7 @@ def update(configuration: dict, state: dict):
 
 
 # Create the connector object using the schema and update functions
-connector = Connector(update=update, schema=schema)
+connector = Connector(update=update, schema=schema, configuration_form=configuration_form)
 
 # Check if the script is being run as the main module.
 # This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.

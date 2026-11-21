@@ -14,6 +14,8 @@ Syncs learning data from the Degreed API (v2) using the Fivetran Connector SDK. 
 
 Keep real credentials out of version control.
 
+The connector defines a setup form, so the credentials can be entered in the Fivetran dashboard instead. A setup test fetches a token and reads one user when the connection is saved. Locally, `fivetran configuration` collects the values and `fivetran configuration --test` runs the setup test.
+
 ## Tables
 
 | Table | Primary key | Sync |
