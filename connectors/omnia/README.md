@@ -14,6 +14,8 @@ The endpoints, response envelope and field names in this connector are assumed f
 
 Keep real keys out of version control.
 
+The connector defines a setup form, so the key can be entered in the Fivetran dashboard instead. A setup test checks the key with a one-row request to `/products` (a single attempt, no retries) when the connection is saved. Locally, `fivetran configuration` collects the values and `fivetran configuration --test` runs the setup test.
+
 ## Tables
 
 | Table | Primary key | Sync |

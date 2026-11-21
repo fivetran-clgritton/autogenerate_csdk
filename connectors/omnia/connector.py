@@ -14,7 +14,7 @@ import time
 import requests
 
 # Import required classes from fivetran_connector_sdk
-from fivetran_connector_sdk import Connector
+from fivetran_connector_sdk import Connector, ConfigurationForm, Test, form_field
 
 # For enabling Logs in your connector code
 from fivetran_connector_sdk import Logging as log
@@ -85,6 +85,44 @@ def validate_configuration(configuration: dict):
             raise ValueError(f"Missing required configuration value: {key}")
 
 
+def connection_test(configuration: dict):
+    """
+    Setup test that checks the API key with a one-row request to the products endpoint.
+    A single attempt is made so a bad key or unreachable host fails within seconds.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Returns:
+        A success or failure Test result shown on the Fivetran setup page.
+    """
+    test = Test()
+    try:
+        validate_configuration(configuration=configuration)
+        make_request(configuration["api_key"], "/products", {"page": 1, "pageSize": 1}, max_retries=1)
+    except (ValueError, RuntimeError) as error:
+        return test.failure(str(error))
+    return test.success()
+
+
+def configuration_form():
+    """
+    Declare the setup form Fivetran renders for this connector, and its setup test.
+    Returns:
+        A ConfigurationForm with one field per configuration key and one setup test.
+    """
+    form = ConfigurationForm()
+    form.add_field(
+        form_field.TextField(
+            "api_key",
+            label="Omnia Retail API key",
+            required=True,
+            field_type=form_field.TextField.password,
+            description="API key for your Omnia Retail account, sent as a Bearer token.",
+        )
+    )
+    form.add_test(label="Check the API key against Omnia Retail", func=connection_test)
+    return form
+
+
 def schema(configuration: dict):
     """
     Define the schema function which lets you configure the schema your connector delivers.
@@ -120,13 +158,14 @@ def schema(configuration: dict):
     ]
 
 
-def make_request(api_key: str, path: str, params: dict):
+def make_request(api_key: str, path: str, params: dict, max_retries: int = __MAX_RETRIES):
     """
     Send a GET request to the Omnia Retail API, retrying transient failures with exponential backoff.
     Args:
         api_key: the Omnia Retail API key, sent as a Bearer token.
         path: the endpoint path under the base URL.
         params: query parameters.
+        max_retries: number of attempts before giving up.
     Returns:
         The parsed JSON response body.
     Raises:
@@ -137,7 +176,7 @@ def make_request(api_key: str, path: str, params: dict):
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    for attempt in range(__MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             response = requests.get(
                 f"{__BASE_URL}{path}",
@@ -146,7 +185,7 @@ def make_request(api_key: str, path: str, params: dict):
                 timeout=__REQUEST_TIMEOUT_SECONDS,
             )
         except (requests.ConnectionError, requests.Timeout) as error:
-            if attempt == __MAX_RETRIES - 1:
+            if attempt == max_retries - 1:
                 raise RuntimeError(f"Omnia request failed after retries: {error}") from error
             delay = __BACKOFF_BASE_SECONDS**attempt
             log.warning(f"Network error on {path}, retrying in {delay}s: {error}")
@@ -161,13 +200,14 @@ def make_request(api_key: str, path: str, params: dict):
             # Honor Retry-After when the API sends it, otherwise back off exponentially.
             retry_after = response.headers.get("Retry-After", "")
             delay = int(retry_after) if retry_after.isdigit() else __BACKOFF_BASE_SECONDS**attempt
-            log.warning(f"HTTP {response.status_code} on {path}, retrying in {delay}s")
-            time.sleep(delay)
+            if attempt < max_retries - 1:
+                log.warning(f"HTTP {response.status_code} on {path}, retrying in {delay}s")
+                time.sleep(delay)
             continue
         if not response.ok:
             raise RuntimeError(f"Omnia request to {path} failed: HTTP {response.status_code}")
         return response.json()
-    raise RuntimeError(f"Omnia request to {path} still failing after {__MAX_RETRIES} retries")
+    raise RuntimeError(f"Omnia request to {path} still failing after {max_retries} attempts")
 
 
 def extract_items(body):
@@ -344,7 +384,7 @@ def update(configuration: dict, state: dict):
 
 
 # Create the connector object using the schema and update functions
-connector = Connector(update=update, schema=schema)
+connector = Connector(update=update, schema=schema, configuration_form=configuration_form)
 
 # Check if the script is being run as the main module.
 # This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.
