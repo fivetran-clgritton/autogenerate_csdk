@@ -2,8 +2,8 @@ import requests
 from fivetran_connector_sdk import Connector, Operations as op, Logging as log
 
 
-BASE_URL = "https://api.aftership.com/v4"
-PAGE_LIMIT = 200  # max per AfterShip v4 docs
+BASE_URL = "https://api.aftership.com/tracking/2024-10"
+PAGE_LIMIT = 200
 
 
 def schema(configuration: dict):
@@ -13,6 +13,7 @@ def schema(configuration: dict):
             "primary_key": ["id"],
             "columns": {
                 "id": "STRING",
+                "legacy_id": "STRING",
                 "created_at": "UTC_DATETIME",
                 "updated_at": "UTC_DATETIME",
                 "last_updated_at": "UTC_DATETIME",
@@ -24,22 +25,38 @@ def schema(configuration: dict):
                 "tag": "STRING",
                 "subtag": "STRING",
                 "subtag_message": "STRING",
-                "expected_delivery": "STRING",
-                "signed_by": "STRING",
                 "source": "STRING",
+                "signed_by": "STRING",
                 "shipment_type": "STRING",
                 "shipment_weight": "FLOAT",
-                "shipment_weight_unit": "STRING",
+                "shipment_delivery_date": "STRING",
+                "shipment_pickup_date": "STRING",
                 "origin_country_iso3": "STRING",
+                "origin_city": "STRING",
+                "origin_state": "STRING",
+                "origin_postal_code": "STRING",
+                "origin_raw_location": "STRING",
                 "destination_country_iso3": "STRING",
+                "destination_city": "STRING",
+                "destination_state": "STRING",
+                "destination_postal_code": "STRING",
                 "destination_raw_location": "STRING",
                 "customer_name": "STRING",
-                "customer_email": "STRING",
-                "customer_phone": "STRING",
                 "tracking_postal_code": "STRING",
                 "tracking_ship_date": "STRING",
                 "tracking_account_number": "STRING",
                 "tracking_destination_country": "STRING",
+                "on_time_status": "STRING",
+                "on_time_difference": "INT",
+                "transit_time": "INT",
+                "tracked_count": "INT",
+                "failed_delivery_attempts": "INT",
+                "return_to_sender": "BOOLEAN",
+                "first_attempted_at": "UTC_DATETIME",
+                "order_id": "STRING",
+                "order_number": "STRING",
+                "order_date": "STRING",
+                "courier_tracking_link": "STRING",
             },
         },
         {
@@ -51,6 +68,7 @@ def schema(configuration: dict):
                 "city": "STRING",
                 "state": "STRING",
                 "zip": "STRING",
+                "location": "STRING",
                 "country_name": "STRING",
                 "country_iso3": "STRING",
                 "message": "STRING",
@@ -58,9 +76,10 @@ def schema(configuration: dict):
                 "subtag": "STRING",
                 "subtag_message": "STRING",
                 "checkpoint_time": "UTC_DATETIME",
+                "created_at": "UTC_DATETIME",
                 "raw_tag": "STRING",
-                "coordinates_lat": "FLOAT",
-                "coordinates_lng": "FLOAT",
+                "coordinate_lat": "FLOAT",
+                "coordinate_lng": "FLOAT",
             },
         },
         {
@@ -88,12 +107,10 @@ def _headers(api_key: str) -> dict:
     }
 
 
-def _get_trackings(api_key: str, updated_at_min: str, page: int) -> dict:
-    params = {
-        "limit": PAGE_LIMIT,
-        "page": page,
-        "updated_at_min": updated_at_min,
-    }
+def _get_trackings(api_key: str, updated_at_min: str, cursor: str = "") -> dict:
+    params = {"limit": PAGE_LIMIT, "updated_at_min": updated_at_min}
+    if cursor:
+        params["cursor"] = cursor
     resp = requests.get(
         f"{BASE_URL}/trackings",
         headers=_headers(api_key),
@@ -106,7 +123,7 @@ def _get_trackings(api_key: str, updated_at_min: str, page: int) -> dict:
 
 def _get_couriers(api_key: str) -> list:
     resp = requests.get(
-        f"{BASE_URL}/couriers/all",
+        f"{BASE_URL}/couriers",
         headers=_headers(api_key),
         timeout=30,
     )
@@ -115,9 +132,9 @@ def _get_couriers(api_key: str) -> list:
 
 
 def _flatten_tracking(t: dict) -> dict:
-    coords = None
     return {
         "id": t.get("id"),
+        "legacy_id": t.get("legacy_id"),
         "created_at": t.get("created_at"),
         "updated_at": t.get("updated_at"),
         "last_updated_at": t.get("last_updated_at"),
@@ -129,33 +146,50 @@ def _flatten_tracking(t: dict) -> dict:
         "tag": t.get("tag"),
         "subtag": t.get("subtag"),
         "subtag_message": t.get("subtag_message"),
-        "expected_delivery": t.get("expected_delivery"),
-        "signed_by": t.get("signed_by"),
         "source": t.get("source"),
+        "signed_by": t.get("signed_by"),
         "shipment_type": t.get("shipment_type"),
         "shipment_weight": t.get("shipment_weight"),
-        "shipment_weight_unit": t.get("shipment_weight_unit"),
+        "shipment_delivery_date": t.get("shipment_delivery_date"),
+        "shipment_pickup_date": t.get("shipment_pickup_date"),
         "origin_country_iso3": t.get("origin_country_iso3"),
+        "origin_city": t.get("origin_city"),
+        "origin_state": t.get("origin_state"),
+        "origin_postal_code": t.get("origin_postal_code"),
+        "origin_raw_location": t.get("origin_raw_location"),
         "destination_country_iso3": t.get("destination_country_iso3"),
+        "destination_city": t.get("destination_city"),
+        "destination_state": t.get("destination_state"),
+        "destination_postal_code": t.get("destination_postal_code"),
         "destination_raw_location": t.get("destination_raw_location"),
         "customer_name": t.get("customer_name"),
-        "customer_email": t.get("customer_email"),
-        "customer_phone": t.get("customer_phone"),
         "tracking_postal_code": t.get("tracking_postal_code"),
         "tracking_ship_date": t.get("tracking_ship_date"),
         "tracking_account_number": t.get("tracking_account_number"),
         "tracking_destination_country": t.get("tracking_destination_country"),
+        "on_time_status": t.get("on_time_status"),
+        "on_time_difference": t.get("on_time_difference"),
+        "transit_time": t.get("transit_time"),
+        "tracked_count": t.get("tracked_count"),
+        "failed_delivery_attempts": t.get("failed_delivery_attempts"),
+        "return_to_sender": t.get("return_to_sender"),
+        "first_attempted_at": t.get("first_attempted_at"),
+        "order_id": t.get("order_id"),
+        "order_number": t.get("order_number"),
+        "order_date": t.get("order_date"),
+        "courier_tracking_link": t.get("courier_tracking_link"),
     }
 
 
 def _flatten_checkpoint(tracking_id: str, cp: dict) -> dict:
-    coords = cp.get("coordinates") or {}
+    coord = cp.get("coordinate") or {}
     return {
         "tracking_id": tracking_id,
         "slug": cp.get("slug"),
         "city": cp.get("city"),
         "state": cp.get("state"),
         "zip": cp.get("zip"),
+        "location": cp.get("location"),
         "country_name": cp.get("country_name"),
         "country_iso3": cp.get("country_iso3"),
         "message": cp.get("message"),
@@ -163,9 +197,10 @@ def _flatten_checkpoint(tracking_id: str, cp: dict) -> dict:
         "subtag": cp.get("subtag"),
         "subtag_message": cp.get("subtag_message"),
         "checkpoint_time": cp.get("checkpoint_time"),
+        "created_at": cp.get("created_at"),
         "raw_tag": cp.get("raw_tag"),
-        "coordinates_lat": coords.get("lat") if isinstance(coords, dict) else None,
-        "coordinates_lng": coords.get("lng") if isinstance(coords, dict) else None,
+        "coordinate_lat": coord.get("latitude") if isinstance(coord, dict) else None,
+        "coordinate_lng": coord.get("longitude") if isinstance(coord, dict) else None,
     }
 
 
@@ -176,15 +211,13 @@ def update(configuration: dict, state: dict):
     latest_updated_at = updated_at_min
 
     # --- Trackings (incremental) ---
-    page = 1
+    cursor = ""
     total_synced = 0
     while True:
-        log.info(f"Fetching trackings page {page} updated since {updated_at_min}")
-        data = _get_trackings(api_key, updated_at_min, page)
+        log.info(f"Fetching trackings updated since {updated_at_min} cursor={cursor!r}")
+        data = _get_trackings(api_key, updated_at_min, cursor)
+        pagination = data.get("data", {}).get("pagination", {})
         trackings = data.get("data", {}).get("trackings", [])
-
-        if not trackings:
-            break
 
         for t in trackings:
             yield op.upsert("trackings", _flatten_tracking(t))
@@ -192,7 +225,6 @@ def update(configuration: dict, state: dict):
             for cp in t.get("checkpoints", []):
                 yield op.upsert("checkpoints", _flatten_checkpoint(t["id"], cp))
 
-            # Track the most recent updated_at seen
             t_updated = t.get("updated_at", "")
             if t_updated and t_updated > latest_updated_at:
                 latest_updated_at = t_updated
@@ -200,9 +232,9 @@ def update(configuration: dict, state: dict):
         total_synced += len(trackings)
         log.info(f"Synced {total_synced} trackings so far")
 
-        if len(trackings) < PAGE_LIMIT:
+        if not pagination.get("has_next_page"):
             break
-        page += 1
+        cursor = pagination.get("next_cursor", "")
 
     # --- Couriers (full refresh) ---
     log.info("Fetching all couriers")
