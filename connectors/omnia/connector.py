@@ -1,196 +1,352 @@
-# Omnia Retail connector — dynamic pricing API
-# API docs: api-docs.omniaretail.dev
-# Auth: Bearer token (api_key from configuration)
-# Base URL: https://api.omniaretail.com
-#
-# ASSUMPTIONS (verify against live API):
-#   - GET /products           — product catalog with current prices
-#   - GET /strategies         — pricing strategies/rules
-#   - GET /price-history      — historical prices; supports ?from=ISO8601&to=ISO8601
-#   - Pagination via ?page=N&pageSize=N; response includes totalPages or similar
-#   - Bearer token auth: Authorization: Bearer <api_key>
-#
-# Update configuration.json with a real api_key before running.
+# Built using Connector SDK AI Plugin
+# Plugin: fivetran-connector-sdk (claude-code) | Version: 2026.11.18.3
+"""This connector syncs pricing data from the Omnia Retail API: products, pricing strategies and price history.
+The endpoints, response envelope and field names are assumed from API conventions and are not yet verified
+against a live account (see README.md).
+See the Technical Reference documentation (https://fivetran.com/docs/connector-sdk/technical-reference)
+and the Best Practices documentation (https://fivetran.com/docs/connector-sdk#connectordevelopmentbestpractices) for details
+"""
 
+# For adding a delay between retries
+import time
+
+# For making API requests
 import requests
-from fivetran_connector_sdk import Connector, Operations as op, Logging as log
 
-BASE_URL = "https://api.omniaretail.com"
-PAGE_SIZE = 500
+# Import required classes from fivetran_connector_sdk
+from fivetran_connector_sdk import Connector
+
+# For enabling Logs in your connector code
+from fivetran_connector_sdk import Logging as log
+
+# For supporting Data operations like upsert() and checkpoint()
+from fivetran_connector_sdk import Operations as op
+
+__BASE_URL = "https://api.omniaretail.com"
+__PAGE_SIZE = 500
+__MAX_RETRIES = 5
+__BACKOFF_BASE_SECONDS = 2
+__REQUEST_TIMEOUT_SECONDS = 30
+__DEFAULT_HISTORY_START = "2020-01-01T00:00:00Z"
+
+# Output column -> accepted source keys (camelCase first, then snake_case). The first value that is not None wins.
+__STRATEGY_FIELDS = {
+    "name": ("name",),
+    "type": ("type",),
+    "description": ("description",),
+    "currency": ("currency",),
+    "is_active": ("isActive", "is_active"),
+    "created_at": ("createdAt", "created_at"),
+    "updated_at": ("updatedAt", "updated_at"),
+    "rule_count": ("ruleCount", "rule_count"),
+    "product_count": ("productCount", "product_count"),
+}
+
+__PRODUCT_FIELDS = {
+    "ean": ("ean",),
+    "sku": ("sku",),
+    "name": ("name",),
+    "brand": ("brand",),
+    "category": ("category",),
+    "current_price": ("currentPrice", "current_price"),
+    "cost_price": ("costPrice", "cost_price"),
+    "currency": ("currency",),
+    "strategy_name": ("strategyName", "strategy_name"),
+    "calculated_price": ("calculatedPrice", "calculated_price"),
+    "min_price": ("minPrice", "min_price"),
+    "max_price": ("maxPrice", "max_price"),
+    "stock": ("stock",),
+    "active": ("active",),
+    "updated_at": ("updatedAt", "updated_at"),
+}
+
+__HISTORY_FIELDS = {
+    "ean": ("ean",),
+    "price": ("price",),
+    "cost_price": ("costPrice", "cost_price"),
+    "currency": ("currency",),
+    "strategy_name": ("strategyName", "strategy_name"),
+    "source": ("source",),
+    "competitor_name": ("competitorName", "competitor_name"),
+    "competitor_price": ("competitorPrice", "competitor_price"),
+}
+
+
+def validate_configuration(configuration: dict):
+    """
+    Validate the configuration dictionary to ensure it contains all required parameters.
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    Raises:
+        ValueError: if any required configuration parameter is missing.
+    """
+    for key in ["api_key"]:
+        if not configuration.get(key):
+            raise ValueError(f"Missing required configuration value: {key}")
 
 
 def schema(configuration: dict):
+    """
+    Define the schema function which lets you configure the schema your connector delivers.
+    Only primary keys and the columns whose type must be forced are declared, so the SDK infers the rest.
+    See the technical reference documentation for more details on the schema function:
+    https://fivetran.com/docs/connector-sdk/technical-reference/connector-sdk-methods#schema
+    Args:
+        configuration: a dictionary that holds the configuration settings for the connector.
+    """
     return [
         {
             "table": "products",
             "primary_key": ["id"],
             "columns": {
-                "id": "STRING",
-                "ean": "STRING",
-                "sku": "STRING",
-                "name": "STRING",
-                "brand": "STRING",
-                "category": "STRING",
                 "current_price": "FLOAT",
                 "cost_price": "FLOAT",
-                "currency": "STRING",
-                "strategy_id": "STRING",
-                "strategy_name": "STRING",
                 "calculated_price": "FLOAT",
                 "min_price": "FLOAT",
                 "max_price": "FLOAT",
-                "stock": "INT",
-                "active": "BOOLEAN",
                 "updated_at": "UTC_DATETIME",
             },
         },
         {
             "table": "pricing_strategies",
             "primary_key": ["id"],
-            "columns": {
-                "id": "STRING",
-                "name": "STRING",
-                "type": "STRING",
-                "description": "STRING",
-                "currency": "STRING",
-                "is_active": "BOOLEAN",
-                "created_at": "UTC_DATETIME",
-                "updated_at": "UTC_DATETIME",
-                "rule_count": "INT",
-                "product_count": "INT",
-            },
+            "columns": {"created_at": "UTC_DATETIME", "updated_at": "UTC_DATETIME"},
         },
         {
             "table": "price_history",
             "primary_key": ["product_id", "timestamp"],
-            "columns": {
-                "product_id": "STRING",
-                "ean": "STRING",
-                "timestamp": "UTC_DATETIME",
-                "price": "FLOAT",
-                "cost_price": "FLOAT",
-                "currency": "STRING",
-                "strategy_id": "STRING",
-                "strategy_name": "STRING",
-                "source": "STRING",
-                "competitor_name": "STRING",
-                "competitor_price": "FLOAT",
-            },
+            "columns": {"price": "FLOAT", "cost_price": "FLOAT", "competitor_price": "FLOAT"},
         },
     ]
 
 
-def _headers(api_key: str) -> dict:
-    return {
+def make_request(api_key: str, path: str, params: dict):
+    """
+    Send a GET request to the Omnia Retail API, retrying transient failures with exponential backoff.
+    Args:
+        api_key: the Omnia Retail API key, sent as a Bearer token.
+        path: the endpoint path under the base URL.
+        params: query parameters.
+    Returns:
+        The parsed JSON response body.
+    Raises:
+        RuntimeError: on authentication failures, other 4xx responses, or when retries are exhausted.
+    """
+    headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    for attempt in range(__MAX_RETRIES):
+        try:
+            response = requests.get(
+                f"{__BASE_URL}{path}",
+                headers=headers,
+                params=params,
+                timeout=__REQUEST_TIMEOUT_SECONDS,
+            )
+        except (requests.ConnectionError, requests.Timeout) as error:
+            if attempt == __MAX_RETRIES - 1:
+                raise RuntimeError(f"Omnia request failed after retries: {error}") from error
+            delay = __BACKOFF_BASE_SECONDS**attempt
+            log.warning(f"Network error on {path}, retrying in {delay}s: {error}")
+            time.sleep(delay)
+            continue
+
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"Omnia rejected the API key (HTTP {response.status_code}). Check api_key."
+            )
+        if response.status_code == 429 or response.status_code >= 500:
+            # Honor Retry-After when the API sends it, otherwise back off exponentially.
+            retry_after = response.headers.get("Retry-After", "")
+            delay = int(retry_after) if retry_after.isdigit() else __BACKOFF_BASE_SECONDS**attempt
+            log.warning(f"HTTP {response.status_code} on {path}, retrying in {delay}s")
+            time.sleep(delay)
+            continue
+        if not response.ok:
+            raise RuntimeError(f"Omnia request to {path} failed: HTTP {response.status_code}")
+        return response.json()
+    raise RuntimeError(f"Omnia request to {path} still failing after {__MAX_RETRIES} retries")
 
 
-def _get_all_pages(api_key: str, path: str, params: dict = None) -> list:
-    """Fetch all pages for a paginated endpoint."""
-    params = params or {}
-    params["pageSize"] = PAGE_SIZE
+def extract_items(body):
+    """
+    Return the list of records from a response that is either a bare list or a {data|items|...} envelope.
+    Args:
+        body: the parsed JSON response body.
+    Returns:
+        A list of records.
+    """
+    if isinstance(body, list):
+        return body
+    return (
+        body.get("data")
+        or body.get("items")
+        or body.get("products")
+        or body.get("strategies")
+        or []
+    )
+
+
+def for_each_page(api_key: str, path: str, handle_page, params: dict = None):
+    """
+    Page through an endpoint (page and pageSize parameters) and pass each page of records to a handler,
+    so the full result set is never held in memory.
+    Args:
+        api_key: the Omnia Retail API key.
+        path: the endpoint path under the base URL.
+        handle_page: callable that receives the list of records of one page.
+        params: optional extra query parameters.
+    Returns:
+        The total number of records processed.
+    """
+    query = dict(params or {})
+    query["pageSize"] = __PAGE_SIZE
     page = 1
-    results = []
+    total = 0
     while True:
-        params["page"] = page
-        resp = requests.get(
-            f"{BASE_URL}{path}",
-            headers=_headers(api_key),
-            params=params,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        # Support both list response and {data: [...], totalPages: N} envelope
-        if isinstance(body, list):
-            items = body
-        else:
-            items = body.get("data") or body.get("items") or body.get("products") or body.get("strategies") or []
-        results.extend(items)
-        total_pages = body.get("totalPages") or body.get("total_pages") if isinstance(body, dict) else None
+        query["page"] = page
+        body = make_request(api_key, path, query)
+        items = extract_items(body)
+        if items:
+            handle_page(items)
+            total += len(items)
+        total_pages = (body.get("totalPages") or body.get("total_pages")) if isinstance(body, dict) else None
         if not items or (total_pages is not None and page >= total_pages):
-            break
+            return total
         page += 1
-    return results
+
+
+def first_value(record: dict, keys: tuple):
+    """
+    Return the first value among the given keys that is not None.
+    Args:
+        record: the source record.
+        keys: candidate keys in priority order.
+    Returns:
+        The value, or None if every key is missing or None.
+    """
+    for key in keys:
+        if record.get(key) is not None:
+            return record[key]
+    return None
+
+
+def map_record(record: dict, fields: dict):
+    """
+    Build an output row from a source record using an output-column to source-keys mapping.
+    Args:
+        record: the source record.
+        fields: mapping of output column to accepted source keys.
+    Returns:
+        A row dictionary.
+    """
+    return {column: first_value(record, keys) for column, keys in fields.items()}
+
+
+def as_text(value):
+    """
+    Convert an identifier to a string, using an empty string when it is missing.
+    Args:
+        value: the identifier value or None.
+    Returns:
+        The identifier as a string.
+    """
+    return "" if value is None else str(value)
+
+
+def sync_strategies(api_key: str):
+    """
+    Upsert all pricing strategies (full refresh each sync).
+    Args:
+        api_key: the Omnia Retail API key.
+    """
+
+    def handle_page(items):
+        for strategy in items:
+            row = map_record(strategy, __STRATEGY_FIELDS)
+            row["id"] = as_text(strategy.get("id"))
+            # The 'upsert' operation inserts or updates a row by primary key.
+            op.upsert(table="pricing_strategies", data=row)
+
+    total = for_each_page(api_key, "/strategies", handle_page)
+    log.info(f"Synced {total} pricing strategies")
+
+
+def sync_products(api_key: str):
+    """
+    Upsert all products (full refresh each sync).
+    Args:
+        api_key: the Omnia Retail API key.
+    """
+
+    def handle_page(items):
+        for product in items:
+            row = map_record(product, __PRODUCT_FIELDS)
+            row["id"] = as_text(product.get("id"))
+            row["strategy_id"] = as_text(first_value(product, ("strategyId", "strategy_id")))
+            op.upsert(table="products", data=row)
+
+    total = for_each_page(api_key, "/products", handle_page)
+    log.info(f"Synced {total} products")
+
+
+def sync_price_history(api_key: str, history_from: str):
+    """
+    Upsert price history records since the given timestamp, tracking the latest timestamp seen.
+    Args:
+        api_key: the Omnia Retail API key.
+        history_from: ISO 8601 timestamp sent as the `from` query parameter.
+    Returns:
+        The latest record timestamp seen, or history_from if nothing newer was returned.
+    """
+    latest = {"timestamp": history_from}
+
+    def handle_page(items):
+        for record in items:
+            timestamp = first_value(record, ("timestamp", "date", "createdAt")) or ""
+            if timestamp and timestamp > latest["timestamp"]:
+                latest["timestamp"] = timestamp
+            row = map_record(record, __HISTORY_FIELDS)
+            row["product_id"] = as_text(first_value(record, ("productId", "product_id")))
+            row["timestamp"] = timestamp
+            row["strategy_id"] = as_text(first_value(record, ("strategyId", "strategy_id")))
+            op.upsert(table="price_history", data=row)
+
+    total = for_each_page(api_key, "/price-history", handle_page, params={"from": history_from})
+    log.info(f"Synced {total} price history records since {history_from}")
+    return latest["timestamp"]
 
 
 def update(configuration: dict, state: dict):
+    """
+    Define the update function, which is called by Fivetran during each sync.
+    See the technical reference documentation for more details on the update function
+    https://fivetran.com/docs/connector-sdk/technical-reference/connector-sdk-methods#update
+    Args:
+        configuration: A dictionary containing connection details
+        state: A dictionary containing state information from previous runs
+        The state dictionary is empty for the first sync or for any full re-sync
+    """
+    validate_configuration(configuration=configuration)
     api_key = configuration["api_key"]
 
-    # --- Pricing strategies (full refresh) ---
-    log.info("Fetching pricing strategies")
-    strategies = _get_all_pages(api_key, "/strategies")
-    for s in strategies:
-        yield op.upsert("pricing_strategies", {
-            "id": str(s.get("id", "")),
-            "name": s.get("name"),
-            "type": s.get("type"),
-            "description": s.get("description"),
-            "currency": s.get("currency"),
-            "is_active": s.get("isActive") if s.get("isActive") is not None else s.get("is_active"),
-            "created_at": s.get("createdAt") or s.get("created_at"),
-            "updated_at": s.get("updatedAt") or s.get("updated_at"),
-            "rule_count": s.get("ruleCount") or s.get("rule_count"),
-            "product_count": s.get("productCount") or s.get("product_count"),
-        })
-    log.info(f"Synced {len(strategies)} strategies")
+    sync_strategies(api_key)
+    sync_products(api_key)
+    latest_timestamp = sync_price_history(
+        api_key, state.get("price_history_from", __DEFAULT_HISTORY_START)
+    )
 
-    # --- Products (full refresh) ---
-    log.info("Fetching products")
-    products = _get_all_pages(api_key, "/products")
-    for p in products:
-        yield op.upsert("products", {
-            "id": str(p.get("id", "")),
-            "ean": p.get("ean"),
-            "sku": p.get("sku"),
-            "name": p.get("name"),
-            "brand": p.get("brand"),
-            "category": p.get("category"),
-            "current_price": p.get("currentPrice") or p.get("current_price"),
-            "cost_price": p.get("costPrice") or p.get("cost_price"),
-            "currency": p.get("currency"),
-            "strategy_id": str(p.get("strategyId") or p.get("strategy_id") or ""),
-            "strategy_name": p.get("strategyName") or p.get("strategy_name"),
-            "calculated_price": p.get("calculatedPrice") or p.get("calculated_price"),
-            "min_price": p.get("minPrice") or p.get("min_price"),
-            "max_price": p.get("maxPrice") or p.get("max_price"),
-            "stock": p.get("stock"),
-            "active": p.get("active"),
-            "updated_at": p.get("updatedAt") or p.get("updated_at"),
-        })
-    log.info(f"Synced {len(products)} products")
-
-    # --- Price history (incremental by date) ---
-    history_from = state.get("price_history_from", "2020-01-01T00:00:00Z")
-    log.info(f"Fetching price history from {history_from}")
-    history = _get_all_pages(api_key, "/price-history", params={"from": history_from})
-    latest_ts = history_from
-    for h in history:
-        ts = h.get("timestamp") or h.get("date") or h.get("createdAt") or ""
-        if ts and ts > latest_ts:
-            latest_ts = ts
-        yield op.upsert("price_history", {
-            "product_id": str(h.get("productId") or h.get("product_id") or ""),
-            "ean": h.get("ean"),
-            "timestamp": ts,
-            "price": h.get("price"),
-            "cost_price": h.get("costPrice") or h.get("cost_price"),
-            "currency": h.get("currency"),
-            "strategy_id": str(h.get("strategyId") or h.get("strategy_id") or ""),
-            "strategy_name": h.get("strategyName") or h.get("strategy_name"),
-            "source": h.get("source"),
-            "competitor_name": h.get("competitorName") or h.get("competitor_name"),
-            "competitor_price": h.get("competitorPrice") or h.get("competitor_price"),
-        })
-    log.info(f"Synced {len(history)} price history records")
-
-    yield op.checkpoint(state={"price_history_from": latest_ts})
+    # Save the progress by checkpointing the state. This is important for ensuring that the sync
+    # process can resume from the correct position in case of next sync or interruptions.
+    op.checkpoint(state={"price_history_from": latest_timestamp})
 
 
+# Create the connector object using the schema and update functions
 connector = Connector(update=update, schema=schema)
 
+# Check if the script is being run as the main module.
+# This is Python's standard entry method allowing your script to be run directly from the command line or IDE 'run' button.
 if __name__ == "__main__":
     connector.debug()
