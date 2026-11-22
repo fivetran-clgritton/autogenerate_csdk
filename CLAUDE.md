@@ -123,7 +123,7 @@ These are **general connectors** for customers running these databases, not harn
 
 1. **Discover tables and columns from the database catalog.** Never hardcode table names, column lists, primary keys or cursor columns. Use the source's catalog: `INFORMATION_SCHEMA` (IRIS, Mimer, H2), `EXA_ALL_TABLES` / `EXA_ALL_COLUMNS` / `EXA_ALL_CONSTRAINT_COLUMNS` (Exasol), `db_class` / `db_attribute` / `db_index` (CUBRID), the region list from the dev REST API (Geode, sampling entries for fields), and so on for new databases.
 2. **Let the user scope the sync.** Configuration should allow selecting schemas and including or excluding tables (flat string values, e.g. comma-separated lists, per the SDK's `configuration.json` rules). Exclude system schemas by default.
-3. **Take primary keys from the catalog.** For a table with no primary key, use the SDK behaviour (no `primary_key`, so Fivetran adds `_fivetran_id`) and say so in a log message.
+3. **Take primary keys from the catalog. Sync only tables that have one** (decided 2026-11-22, first pass). Skip tables without a primary key and list them in one `op.warning`. Without a key, Fivetran hashes every value into `_fivetran_id`, which makes upserts slow and collapses exact-duplicate rows (IRIS test: 5 source rows became 2). Support for them may come later.
 4. **Choose a sync strategy per table.**
    - **Incremental:** when a usable cursor column exists (configurable, defaulting to a convention such as `updated_at`). Read `cursor >= last value` with keyset paging on `(cursor, primary key)`.
    - **Full reload:** for tables with no usable cursor. Use `op.truncate(table, deferred=True)` and then upsert every row, so a failed sync deletes nothing.
@@ -132,11 +132,35 @@ These are **general connectors** for customers running these databases, not harn
    - For very large incremental tables, the same connector **chunks** the cursor. It finds an upper bound with `ORDER BY rk LIMIT 1 OFFSET chunk_size-1`, declares a cursor over `rk > bookmark AND rk <= upper_bound`, and checkpoints `upper_bound` after each chunk. The `<=` keeps all rows with the boundary value in one chunk, so ties are safe and each transaction stays bounded. (Its extra row-count checkpoints inside a chunk use the last row's value with `>`, which can skip ties on resume. Don't copy that part.)
    - The same connector is also the reference for discovery: `information_schema` tables, columns and primary keys, replication-key inference from column types, include/exclude projection, full-resync fallback, and parallel tables through a connection pool.
    - Unverified per-database notes, to check during the full-sync memory tests: Exasol (pyexasol reads through a server-side result handle in chunks), IRIS (SQL `DECLARE CURSOR` may exist only in embedded SQL; also test the raw DB-API cursor without SQLAlchemy), H2 (materializes results unless `LAZY_QUERY_EXECUTION=1`), CUBRID (JDBC fetch size), Mimer (mimerpy server cursor), Vertica (streams natively).
-6. **Checkpoint cadence bounds memory.** The SDK buffers upserted rows in memory until the next `op.checkpoint()` flushes them, so memory scales with the rows between checkpoints, not with table size. Measured with a database-free test connector (2M rows): one checkpoint at the end peaked at 3.5 GB; every 60 s peaked at 1.4 GB; every 10,000 rows peaked at 290 MB. The SDK reference says to checkpoint no more than once a minute, which doesn't account for this. Checkpoint on **whichever comes first: about 60 s or a row cap** (~100k rows, lower for wide rows), plus at the end of each table. A mid-table checkpoint stores the keyset position so a resume is exact. (IRIS currently uses 60 s only; its full sync peaked at 2.54 GB. Add the row cap.)
+6. **Checkpoint cadence bounds memory.** The SDK buffers upserted rows in memory until the next `op.checkpoint()` flushes them, so memory scales with the rows between checkpoints, not with table size. Measured with a database-free test connector (2M rows): one checkpoint at the end peaked at 3.5 GB; every 60 s peaked at 1.4 GB; every 10,000 rows peaked at 290 MB. The SDK reference says to checkpoint no more than once a minute, which doesn't account for this. Checkpoint on **whichever comes first: about 60 s or a row cap** (~100k rows, lower for wide rows), plus at the end of each table. A mid-table checkpoint stores the keyset position so a resume is exact. (IRIS with 60 s only peaked at 2.54 GB on the full sync; with a 100k-row cap it peaked at 1.99 GB.)
 7. **Handle schema drift:** pick up new columns and cope with dropped ones without failing the sync. Declare column types only where a type must be forced (e.g. `DECIMAL` precision/scale, `UTC_DATETIME`), so the SDK can infer the rest and evolve the schema.
 8. **Follow the SDK reference** in the `fivetran-connector-sdk` Claude Code plugin (https://github.com/fivetran/connector_sdk_tools, installed on the VM). In particular: call `op.*` directly (never `yield`), run `/evaluate-connector` before calling a connector done, and keep dependencies the Fivetran runtime lacks (Java/JDBC jars, native client libraries) in mind. Those need the SDK's custom-driver mechanism (`drivers/installation.sh`, Private Preview) or a pure-Python driver.
 
-**Current state:** none of the connectors meet requirements 1-4 or 7 yet. They are hardcoded to `customers` / `orders` with `id` / `updated_at` (Geode reads regions from config and samples one entry). IRIS is the first being reworked: it has batched keyset reads and 60 s checkpoints (requirements 5 and 6). Its full initial sync (1M customers + 10M orders, 42 min, peak 2.54 GB) passed a content comparison against the source: counts, distinct ids, column sums, min/max timestamps, per-status counts and a 2,000-row field-by-field sample per table.
+**Current state (2026-11-22):** IRIS meets requirements 1-7 and is the template (see **Porting the IRIS template**). It passed edge-case tests (string/composite keys, keyless table skipped, every column type, NULL cursors, add/drop column, update, delete, strategy change, resume from a saved position, multi-batch paging with tied cursor values) and a full initial sync of 1M customers + 10M orders (29 min, peak 1.99 GB, `--naming SOURCE`) with a content comparison against the source: counts, distinct ids, column sums, min/max timestamps, per-status counts and a 2,000-row field-by-field sample per table. The 12 test scenarios have not been run yet. The other connectors are still hardcoded to `customers` / `orders` with `id` / `updated_at` (Geode reads regions from config and samples one entry).
+
+## Porting the IRIS template
+
+`iris/connector.py` is the reference implementation of the requirements above. Database-specific parts are marked `IRIS:`; everything else should carry over with little change. To port it:
+
+1. **Catalog queries** (`_discover`, `_load_schema_catalog`): base tables, columns (name, type, precision, scale, nullable), primary-key columns in key order, and leading index columns (for the "cursor not indexed" warning). Exclude system schemas by default (`SYSTEM_SCHEMAS`, `SYSTEM_SCHEMA_PREFIXES`); a schema listed in `schemas` is synced even if it is a system schema.
+2. **Type sets** (`TIMESTAMP_TYPES`, `DECIMAL_TYPES`, ...): map the catalog's type names. Declare in `schema()` only DECIMAL (precision/scale, max 38), timestamps (`NAIVE_DATETIME` unless the type carries a zone, then `UTC_DATETIME`), dates, booleans and binary. Everything else is inferred.
+3. **Batched reads** (`_read_rows`): `TOP n` becomes `LIMIT n` / `FETCH FIRST n ROWS ONLY` as the dialect needs. `_keyset_condition` expands `(a, b) > (x, y)` into OR/AND form, so it works without row-value comparison. Or replace batching with a server-side cursor where the driver supports one (requirement 5), and verify memory with the full sync.
+4. **Driver quirks**: IRIS returns ordered columns in an internal form unless cast (`_select_expr`). Check your driver: select a timestamp, date and numeric column while ordering by it and look at the Python types that come back.
+5. **Tables without a primary key** are skipped (requirement 3), so every keyset is (cursor, primary key) or the primary key alone; no row-id paging is needed.
+6. **Keep unchanged**: config keys (`schemas`, `include_tables`, `exclude_tables`, `cursor_columns`, `cursor_overrides`), state layout (`{"tables": {"<schema>.<table>": {"mode", "cursor_column", "cursor", "after", "columns"}}}`), `schema=` on every operation, checkpoint cadence (60 s or row cap), deferred truncate for full reloads (not re-issued on resume), NULL-cursor re-send, strategy-change reset, drift warnings.
+
+Test with the same steps IRIS used: small edge-case tables in a separate schema (string PK, composite PK, no PK (must be skipped with a warning), nullable cursor with NULLs, every column type), a second sync after add/drop column + update + delete, a `cursor_overrides` strategy change, a resume from a hand-written `after` position, then the full sync of the seeded tables with a content comparison. Run `/evaluate-connector`.
+
+## Parallel work (one agent per database)
+
+After IRIS, each remaining SQL connector is ported by its own Claude session in its own git worktree (`/opt/sdk-test-dbs/wt-<db>`, branch `<db>-general`). Rules:
+
+- **Own one database.** Only touch your connector directory and your database. Test tables go in a schema of your own (e.g. `FTTest`). Do not reseed or change the seeded `customers` / `orders`.
+- **Never run `seed_all.sh`** while other agents are working: it resets the main checkout and reloads data under other agents' tests. Ask the user.
+- **Check `free -g` before a full sync** of the 11M-row tables and do not start one with less than 8 GB available. Peak-memory numbers are only meaningful when no other full sync is running; note in your results whether one was.
+- **Run `fivetran debug` from your worktree** (or a scratch copy) so the `files/warehouse.db` output is yours. Keep config/state files with passwords in your session scratchpad, never in the repo.
+- **Record results in `<db>/NOTES.md`**, not in this file: what was tested, numbers, quirks found. CLAUDE.md is merged once at the end.
+- **Commit and push your branch**; the user opens the PRs.
 
 ## Connector Code
 
@@ -145,7 +169,7 @@ One directory per connector in this repo (`<name>/connector.py`, `configuration.
 | Connector | Driver | Sync strategy | Status |
 |-----------|--------|---------------|--------|
 | vertica | vertica-python | cursor on updated_at | Not yet run against a real DB |
-| iris | sqlalchemy-iris | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
+| iris | sqlalchemy-iris | catalog discovery; incremental on `updated_at` (configurable) or full reload | General connector; edge-case tests + full initial sync with content comparison passed (2026-11-22); 12 scenarios not yet run |
 | exasol | pyexasol | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
 | voltdb | requests (REST) | cursor on updated_at | SKIPPED |
 | geode | requests (REST + OQL, port 8081) | cursor on updated_at | Smoke-tested: small incremental sync + one full initial sync, row counts match (2026-11-21) |
@@ -160,6 +184,9 @@ One directory per connector in this repo (`<name>/connector.py`, `configuration.
 Running `fivetran debug` on the VM:
 - The `fivetran` CLI uses system Python 3.11 and does not install connector requirements. Install JDBC deps without root: `/usr/bin/python3 -m pip install --target ~/connector-deps jaydebeapi JPype1`, then run with `PYTHONPATH=~/connector-deps`.
 - Use a scratch config/state file instead of editing `configuration.json`, so real passwords stay out of the repo. `debug` writes the final checkpoint back to the `--state` file.
+- For long runs use `PYTHONUNBUFFERED=1` when redirecting output to a file (otherwise the log lags by minutes) and `--naming SOURCE`: the local debug runner re-normalizes every column name on every row, which was ~40% of sync time in a profile and does not happen in production. Column names that are already lowercase snake_case come out the same either way.
+- Connectors log a timing breakdown every 250k rows and per table (`query`, `fetch`, `convert`, `upsert`, `checkpoint`). IRIS full sync of orders (10M rows): upsert 38%, query 22% (no index on `updated_at`, so each 50k batch re-scans and sorts the remaining rows, ~1.8 s), fetch 13%, convert 13%, checkpoint 13%. Fetch and convert time per row doubled over the run while process memory grew to ~2 GB; suspected garbage-collector cost on the debug runner's growing heap, not yet confirmed.
+- Pass timestamps and dates to `op.upsert` as `datetime`/`date` objects, not ISO strings: the SDK re-parses strings with `strptime` (~13% of sync time in a profile).
 - Seeded data is dated 2022-2024. To test without syncing 11M rows, start from a late cursor, e.g. `{"customers_cursor": "2024-12-30 12:00:00", "orders_cursor": "2024-12-31 12:00:00"}`.
 - The SDK requires `DECIMAL` columns to declare `precision`/`scale` in `schema()`, `DECIMAL` values as `str`/`int`, and `UTC_DATETIME` values as ISO 8601 with a zone. `schema()` returns a list of dicts (`{"table", "primary_key", "columns": {name: type}}`); there is no `SchemaBuilder` or `DataType`. `op.upsert` takes one record dict, not a list. `vertica` and `voltdb` were written against the same wrong API and will need the same treatment.
 - Connector-specific gotchas found while debugging:
@@ -211,16 +238,17 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 | `DOCKER_HUB_USER` | Docker Hub username (for pulling `vertica/vertica-ce`) |
 | `DOCKER_HUB_TOKEN` | Docker Hub personal access token |
 
-## Handoff / current state (2026-11-21)
+## Handoff / current state (2026-11-22)
 
-- Work is on branch `fix-db-seeding` (pushed; 2 commits on top of `main`). **The PR is not open yet**: the GitHub token on the VM can push but lacks Pull requests write. Open it at https://github.com/fivetran-clgritton/autogenerate_csdk/pull/new/fix-db-seeding. `seed_all.sh` resets to `origin/main`, so use `SEED_SKIP_UPDATE=1` until it is merged.
+- Work is on branch `fix-db-seeding` (pushed; several commits on top of `main`). **The PR is not open yet**: the GitHub token on the VM can push but lacks Pull requests write. Open it at https://github.com/fivetran-clgritton/autogenerate_csdk/pull/new/fix-db-seeding. `seed_all.sh` resets to `origin/main`, so use `SEED_SKIP_UPDATE=1` until it is merged.
 - VM state outside the repo: `gh` installed and logged in; git identity set in this checkout; JDBC/driver deps for `fivetran debug` in `~/connector-deps` (use `PYTHONPATH=~/connector-deps`); VM compose backup at `/opt/sdk-test-dbs/docker-compose.yml.bak-20261120233821`; Geode PDX persistence configured in its cluster config; Mimer `SEEDDB` databank created; CUBRID `dba` password set.
-- Scratch `fivetran debug` config/state files lived in the previous session's scratchpad and are gone. Recreate them from the password table above, outside the repo. Geode state is `{"<region>": {"last_updated_at": "<ISO ts>"}}`, Exasol `{"<table>": {"updated_at": "..."}}`, the rest `{"<table>_cursor": "..."}`. Mimer also needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts`.
+- Scratch `fivetran debug` config/state files live in each session's scratchpad and are lost between sessions. Recreate them from the password table above, outside the repo. IRIS state is `{"tables": {"<schema>.<table>": {...}}}` (see the porting guide); the old connectors use Geode `{"<region>": {"last_updated_at": "<ISO ts>"}}`, Exasol `{"<table>": {"updated_at": "..."}}`, the rest `{"<table>_cursor": "..."}`. Mimer also needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts`.
+- IRIS has a test schema `FTTest` (tables `typesdemo`, `compositepk`, `nopk`) used for the edge-case tests; it is not part of the seeded data.
 - Two GitHub PATs were pasted into the previous session's transcript; the user was asked to revoke them.
 
 ## Next Steps
 
-1. Make the connectors general (see **Connector Requirements**). Start with IRIS: finish verifying its batched full sync, then add catalog discovery, scoping config and per-table strategy. Use it as the template for Exasol, Mimer, CUBRID and H2, then Geode.
+1. Port the IRIS template to Exasol, Mimer, CUBRID and H2 (one agent per database, see **Parallel work**), then Geode.
 2. Full initial sync per connector (one at a time; the 10M-row orders table is where memory/speed problems will show), with a content comparison against the source, not just counts
 3. Run the 12 test scenarios against each connector (7, 11 and 12 exercise the `>=` cursor change)
 4. Get Vertica running (Docker Hub login), then port its connector to the current SDK API (it uses the same nonexistent APIs the others did)
