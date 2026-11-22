@@ -777,6 +777,14 @@ class _Checkpointer:
     def checkpoint(self):
         started = time.perf_counter()
         op.checkpoint(state=self.state)
+        # CUBRID: JPype installs gc callbacks that keep forcing full Python collections while rows
+        # are fetched (about 190 per 250k rows), and each one walks every long-lived object in the
+        # process (in fivetran debug, a set of every upserted key). The orders full sync spent 4,207
+        # of 5,242 s in them. Collecting once and then freezing the survivors after each checkpoint
+        # keeps them out of later collections (94.6 s -> 0.0 s per 250k rows in isolation). Frozen
+        # objects are still freed by reference counting; only cycles that form later are kept.
+        gc.collect()
+        gc.freeze()
         self.timer.add("checkpoint", time.perf_counter() - started)
         self.rows = 0
         self.last = time.monotonic()
