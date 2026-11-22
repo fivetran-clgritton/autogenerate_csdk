@@ -3,6 +3,8 @@
 ## What this is
 Building Fivetran Connector SDK connectors for legacy databases that have no managed Fivetran connector and are not in `fivetran/community_connectors`. Priority ordered by Gong call demand + build feasibility.
 
+History of what was tried and why things are set up this way: `LESSONS_LEARNED.md`.
+
 ## Where to run Claude Code
 
 - **Anything that touches the databases** (seeding, `fivetran debug`, test scenarios, container logs): run Claude Code **on the VM**, inside tmux so a dropped SSH doesn't kill long jobs:
