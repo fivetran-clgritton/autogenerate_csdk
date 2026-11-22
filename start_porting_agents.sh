@@ -4,8 +4,8 @@
 #   bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh exasol mimer cubrid h2
 #
 # For each database:
-#   - creates ~/wt-<db> on branch <db>-general (from $BASE, default fix-db-seeding) if missing;
-#     fast-forwards an existing worktree to $BASE only if it has no commits or changes of its own
+#   - creates ~/wt-<db> on branch <db>-general (from origin/$BASE, default main) if missing;
+#     fast-forwards an existing worktree to origin/$BASE only if it has no commits or changes of its own
 #   - starts tmux session <db> running Claude with the prompt "Do your porting task", unless a
 #     session with that name already exists
 # The task itself is defined in CLAUDE.md ("Porting tasks"), so nothing depends on this session.
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 REPO=/opt/sdk-test-dbs/connectors
-BASE=${BASE:-fix-db-seeding}
+BASE=${BASE:-main}
 KNOWN="exasol mimer cubrid h2 geode"
 PROMPT="Do your porting task: read the 'Porting tasks' section of CLAUDE.md and follow it for the database this worktree is for."
 
@@ -24,7 +24,13 @@ fi
 command -v tmux >/dev/null || { echo "tmux not found" >&2; exit 1; }
 command -v claude >/dev/null || { echo "claude not found on PATH" >&2; exit 1; }
 
-git -C "$REPO" fetch -q origin "$BASE" || echo "warning: could not fetch origin/$BASE; using the local branch" >&2
+# Start from the remote branch, so a stale local copy of $BASE in the main checkout does not matter
+if git -C "$REPO" fetch -q origin "$BASE"; then
+    START="origin/$BASE"
+else
+    echo "warning: could not fetch origin/$BASE; using the local branch" >&2
+    START="$BASE"
+fi
 
 for db in "$@"; do
     case " $KNOWN " in *" $db "*) ;; *) echo "$db: unknown database (expected one of: $KNOWN)" >&2; continue ;; esac
@@ -35,14 +41,14 @@ for db in "$@"; do
         if git -C "$REPO" show-ref -q --verify "refs/heads/$branch"; then
             git -C "$REPO" worktree add -q "$wt" "$branch"
         else
-            git -C "$REPO" worktree add -q -b "$branch" "$wt" "$BASE"
+            git -C "$REPO" worktree add -q -b "$branch" "$wt" "$START"
         fi
         echo "$db: created worktree $wt on $branch"
     fi
 
     # Bring an untouched worktree up to date; never move one that has its own commits or edits.
-    if [ -z "$(git -C "$wt" status --porcelain)" ] && [ -z "$(git -C "$wt" rev-list "$BASE..HEAD")" ]; then
-        git -C "$wt" merge -q --ff-only "$BASE" && echo "$db: worktree at $(git -C "$wt" rev-parse --short HEAD) ($BASE)"
+    if [ -z "$(git -C "$wt" status --porcelain)" ] && [ -z "$(git -C "$wt" rev-list "$START..HEAD")" ]; then
+        git -C "$wt" merge -q --ff-only "$START" && echo "$db: worktree at $(git -C "$wt" rev-parse --short HEAD) ($START)"
     else
         echo "$db: worktree has its own work; left as is"
     fi
