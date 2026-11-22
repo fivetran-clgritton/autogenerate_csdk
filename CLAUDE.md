@@ -153,7 +153,7 @@ Test with the same steps IRIS used: small edge-case tables in a separate schema 
 
 ## Parallel work (one agent per database)
 
-After IRIS, each remaining SQL connector is ported by its own Claude session in its own git worktree (`/opt/sdk-test-dbs/wt-<db>`, branch `<db>-general`). Rules:
+After IRIS, each remaining SQL connector is ported by its own Claude session in its own git worktree (`~/wt-<db>`, i.e. `/home/CLAbeel/wt-<db>`, branch `<db>-general`; `/opt/sdk-test-dbs` is root-owned). Start it with `tmux new -s <db> 'cd ~/wt-<db> && claude'`. Rules:
 
 - **Own one database.** Only touch your connector directory and your database. Test tables go in a schema of your own (e.g. `FTTest`). Do not reseed or change the seeded `customers` / `orders`.
 - **Never run `seed_all.sh`** while other agents are working: it resets the main checkout and reloads data under other agents' tests. Ask the user.
