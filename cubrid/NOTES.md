@@ -140,6 +140,42 @@ Final state: `cursor` = the `MAX(updated_at)` captured before each table's read 
 The old CLAUDE.md open question (a run with 9,548 upserts instead of 9,989) was with the old
 jaydebeapi connector. This one delivered exactly 11,000,000 upserts for 11,000,000 rows.
 
+## The 12 test scenarios (small fixture, 2026-11-22)
+
+`cubrid/scenarios.py` (adapted from `exasol/scenarios.py`): rebuilds `FTTEST.customers` (seeded `id <= 1000`)
+and `FTTEST.orders` (`id <= 10000`) with `CREATE TABLE ... AS SELECT` plus a primary key on `id`, runs each
+sync as `fivetran debug --naming SOURCE` with `schemas=FTTEST`, `include_tables=customers,orders`, and after
+every scenario compares the whole destination with the source, field by field. "Expected" upserts is
+counted from the source before each sync: rows with `updated_at >= saved cursor` plus NULL-cursor rows.
+The whole run takes about a minute (16 syncs); re-run it after every connector change:
+
+    PYTHONPATH=~/connector-deps /usr/bin/python3 cubrid/scenarios.py --config <scratch>/config.json --work <scratch>/scenarios
+
+| # | Scenario | Result | Detail |
+|---|---|---|---|
+| 1 | Initial sync baseline | PASS | 11,000 upserts; 1,000 + 10,000 rows, every field equal |
+| 2 | 500 new orders | PASS | 502 upserts (500 + one boundary row per table, `>=`); 10,500 rows equal |
+| 3 | 100 updated `amount` | PASS | 601 upserts (expected 601: the 500 rows from 2 share the old cursor value); new values arrive, count unchanged |
+| 4 | 50 soft deletes (`status='cancelled'`) | PASS | 151 upserts (expected 151); statuses updated |
+| 5 | 10 hard deletes | PASS (known gap) | 51 upserts; the 10 rows stay in the destination, not flagged `_fivetran_deleted` (a cursor sync can't see deletes) |
+| 6 | Outage (port 1), then 200 new rows | PASS | failed sync rc 1 with `Could not connect to CUBRID at localhost: Cannot connect to a broker ...` (password masked), state file unchanged; next sync 251 upserts (expected 251), no duplicates |
+| 7 | Mid-sync failure and resume | PASS | patched copy (checkpoint every 1,000 rows, raise at the 5th checkpoint) stopped with 3,000 orders delivered and state `{"high_water": "2025-02-06 00:00:00.000", "after": [3010]}` (mid first sync, primary-key order); 300 rows inserted before resuming with the real connector; resume upserted 7,991 (7,690 remaining + 300 new + 1 customers boundary row); 10,990 rows equal, no duplicates |
+| 8 | Add `discount_pct NUMERIC(5,2)`, set on 100 rows | PASS | 601 upserts; column created, values on those rows, NULL elsewhere; dashboard warning "new columns discount_pct ... re-sync the table to backfill" |
+| 9 | Add `notes VARCHAR(500)`, sync, drop it, sync | PASS | 111 then 21 upserts, no failure; drop logged ("columns no longer in the source: notes"); the destination keeps `notes`, NULL on the 20 rows re-synced after the drop |
+| 10 | 5 rows with ~1 MB payloads | PASS | `payload STRING COLLATE utf8_bin`, 850,000 characters / 1,000,000 bytes each (`é€` included); 26 upserts; all 5 equal in full to the expected Python string |
+| 11 | 20 rows at exactly the saved cursor | PASS | saved cursor 2025-02-10 00:00:00.000; all 20 arrive (26 upserts, expected 26) |
+| 12 | Concurrent writes during a sync | PASS (known gap) | patched copy (fetch 500, chunks 1,000) ran 4 statements on a second connection after 1,000 orders rows had been read from the open streamed query: update 50 already-read rows, update 50 not-yet-read rows, insert 50, and update 10 rows with an **old** `updated_at` (late commit). The sync (3,026 upserts) returned the pre-write values for the not-yet-read rows: the open result set is a snapshot. Follow-up sync: 152 upserts, after which everything matches except the 10 late-commit rows, which a cursor sync can't see |
+
+What the connector does by design, seen here:
+- `>=` re-reads the rows at the saved cursor value on every incremental sync (one per table here), so
+  boundary ties are never lost (scenario 11).
+- A failed sync leaves the state file untouched (`fivetran debug` does not write it on failure). The
+  resume used the last checkpoint the SDK recorded.
+- The first sync of a table reads in primary-key order with a high-water mark, so a resume continues after
+  the last id and also picks up rows inserted in the meantime (scenario 7). `cursor` becomes the high-water
+  mark captured *before* the read, so rows changed during the first sync are re-read next time.
+- Known gaps: hard deletes (5), and commits whose `updated_at` is older than the saved cursor (12).
+
 ## Production deployment
 
 Needs a Java runtime and the CUBRID JDBC jar in the Fivetran container. Neither is in the runtime, so
@@ -153,7 +189,6 @@ The JVM is started with `-Xmx512m`; its memory counts toward the 4 GB limit.
 - `gc.freeze()` is process-wide. It's safe here (the connector owns the process), but if a later SDK
   version keeps long-lived cyclic garbage it would stay frozen until the process exits.
 
-- 12 test scenarios in `test_scenarios.sql` not run.
 - CUBRID before 11.2 (unqualified names) untested.
 - A first sync captures `MAX(cursor)` with one full scan when the cursor is unindexed.
 - Long-running queries hold an MVCC snapshot for the whole read (primary-key reads are chunked to
