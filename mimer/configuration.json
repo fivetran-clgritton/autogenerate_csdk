@@ -1,7 +1,12 @@
 {
-  "host": "<VM_STATIC_IP>",
+  "host": "MIMER_HOST",
   "port": "1360",
+  "database": "mimerdb",
   "username": "SYSADM",
-  "password": "<MIMER_PASS>",
-  "database": "mimerdb"
+  "password": "MIMER_PASSWORD",
+  "schemas": "",
+  "include_tables": "",
+  "exclude_tables": "",
+  "cursor_columns": "updated_at",
+  "cursor_overrides": ""
 }
