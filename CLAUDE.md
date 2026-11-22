@@ -5,6 +5,8 @@ Building Fivetran Connector SDK connectors for legacy databases that have no man
 
 History of what was tried and why things are set up this way: `LESSONS_LEARNED.md`.
 
+The API connectors (AfterShip, EasyPost, Rillet, Omnia, Jobber, Moz, Degreed, Lazada) are a separate workstream, one `<source>-connector` branch each. Status, API findings and next steps: `API_CONNECTORS_HANDOFF.md`.
+
 ## Where to run Claude Code
 
 - **Anything that touches the databases** (seeding, `fivetran debug`, test scenarios, container logs): run Claude Code **on the VM**, inside tmux so a dropped SSH doesn't kill long jobs:
