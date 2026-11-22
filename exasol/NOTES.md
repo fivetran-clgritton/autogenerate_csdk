@@ -64,15 +64,24 @@ fivetran-connector-sdk 3.1.2.
 | `DATE` | `date` | `NAIVE_DATE` |
 | `TIMESTAMP(p)` | naive `datetime` (truncated to microseconds) | `NAIVE_DATETIME` |
 | `TIMESTAMP WITH LOCAL TIME ZONE` | `datetime` in UTC | `UTC_DATETIME` |
-| `CHAR`, `VARCHAR`, `INTERVAL ...`, `GEOMETRY` (WKT), `HASHTYPE` (hex) | str | inferred |
+| `CHAR`, `VARCHAR`, `INTERVAL ...`, `GEOMETRY` (WKT), `HASHTYPE` (hex) | str | `STRING` (see bugs below) |
 
 Cursor types are `TIMESTAMP`, `TIMESTAMP WITH LOCAL TIME ZONE`, `DATE` and `DECIMAL` with
 scale 0.
 
-**Bug found (may affect IRIS too):** an undeclared Python float is inferred by the SDK as 32-bit
-`FLOAT`. In the test, `3.14159265358979` arrived as `3.1415927` and `-1e300` as `-inf`. Exasol now
-declares `DOUBLE`. IRIS does not declare `DOUBLE`/`FLOAT` columns, so it probably has the same loss.
-Not changed here (outside this database's scope).
+**Two SDK inference problems, so every column is declared** (this departs from requirement 7's
+"declare only where a type must be forced": here the type must always be forced). New columns are
+still picked up, because `schema()` declares whatever the catalog lists on each sync.
+
+- An undeclared Python float is inferred as 32-bit `FLOAT`. In the test, `3.14159265358979` arrived
+  as `3.1415927` and `-1e300` as `-inf`. Fixed by declaring `DOUBLE`.
+- An undeclared string column gets a type guessed from its content (first reported by the H2
+  agent; confirmed here with `FTTEST.STRGUESS`). `VARCHAR` values `'t'`, `'123'`, `'2024-01-01'` and
+  `'1.50'` arrived as `BOOLEAN`, `BIGINT`, `DATE` and `DOUBLE` (`1.5`). Fixed by declaring `STRING`.
+
+IRIS declares neither, so it probably has both problems. Not changed here (outside this
+database's scope). The full sync below ran before the `STRING` fix; its text columns (names,
+emails, status words) were not affected, so the comparison still holds.
 
 ## Tests run (test schema `FTTEST`)
 
@@ -84,7 +93,7 @@ lower-case quoted columns, a `TIMESTAMP WITH LOCAL TIME ZONE` cursor), plus `Col
 
 | Test | Result |
 |---|---|
-| Initial sync; type fidelity of every column type | Passed after the `DOUBLE` fix. Local-time-zone value converted from Berlin to UTC correctly. |
+| Initial sync; type fidelity of every column type | Passed after the `DOUBLE` and `STRING` fixes. Local-time-zone value converted from Berlin to UTC correctly. |
 | Keyless table | Skipped with one `op.warning` |
 | NULL cursor rows | Re-sent every sync |
 | Second sync: add column, drop column, update, NULL-cursor update, hard delete, row inserted at exactly the stored cursor value, delete from the full-reload table | Passed. Drift warning for the new column; dropped column NULL in new rows; `>=` picked up the boundary row; hard delete not seen by incremental (expected); full reload marked the deleted row `_fivetran_deleted` |

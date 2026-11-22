@@ -417,7 +417,8 @@ def _is_long(column: dict) -> bool:
 
 
 def _declared_type(column: dict):
-    """Type to declare in schema(), only where the SDK cannot infer it from the delivered value."""
+    """Type to declare in schema(). Every column is declared: the SDK guesses types of undeclared
+    strings from their content, and infers floats as 32-bit FLOAT."""
     data_type = column["type"]
     if data_type in DECIMAL_TYPES:
         # Exasol: INT / BIGINT are DECIMAL(18,0) / DECIMAL(36,0)
@@ -439,7 +440,10 @@ def _declared_type(column: dict):
         return "DOUBLE"
     if data_type in BOOLEAN_TYPES:
         return "BOOLEAN"
-    return None
+    # Declared: without it the SDK guesses a type from the first values it sees. A test turned
+    # VARCHAR 't' into BOOLEAN, '123' into an integer, '2024-01-01' into a DATE and '1.50' into 1.5.
+    # CHAR, VARCHAR, INTERVAL, GEOMETRY and HASHTYPE are all delivered as strings.
+    return "STRING"
 
 
 def _table_definition(spec: dict) -> dict:
