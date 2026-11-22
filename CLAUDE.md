@@ -157,6 +157,16 @@ After IRIS, each remaining connector is ported by its own Claude session in its 
 
 **Starting the agents:** `bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh exasol mimer cubrid h2` (any subset; `geode` once one SQL port is done). It creates missing worktrees, fast-forwards untouched ones to `fix-db-seeding`, and starts each agent in a tmux session named after the database with the prompt "Do your porting task" (see **Porting tasks** below). Attach with `tmux attach -t <db>`; list with `tmux ls`. Re-running it skips sessions that already exist.
 
+**Operator steps (for the user):**
+
+1. In a shell on the VM (inside tmux is fine), run `bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh exasol mimer cubrid h2`.
+2. Visit each session once to answer Claude's "trust this folder" prompt: inside tmux, `Ctrl-b s`, pick the session, Enter; outside tmux, `tmux attach -t <db>`. Leave with `Ctrl-b d` (detach; the agent keeps running).
+3. Agents may pause for tool-permission prompts or questions; check each session now and then (`Ctrl-b s`). `Ctrl-b [` scrolls back (`q` to leave).
+4. Disconnecting SSH does not stop them. To come back: SSH in, `tmux ls`, `tmux attach -t <db>`.
+5. Results: `<db>/NOTES.md` and commits on `<db>-general` (`git -C ~/wt-<db> log --oneline fix-db-seeding..`).
+6. If an agent's Claude has exited, the session shows a shell: run `claude "Do your porting task"` in it. To start a session over: `tmux kill-session -t <db>` and re-run the script.
+7. Start `geode` the same way once one SQL port is done.
+
 Rules:
 
 - **Own one database.** Only touch your connector directory and your database. Test tables go in a schema of your own (e.g. `FTTest`). Do not reseed or change the seeded `customers` / `orders`.
