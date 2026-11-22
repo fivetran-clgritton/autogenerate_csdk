@@ -16,6 +16,7 @@ This connector is the template for the other SQL connectors in this repo. Databa
 are marked "IRIS:".
 """
 
+import gc
 import time
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
@@ -425,6 +426,25 @@ def _keyset_condition(order_columns: list, after: list, params: dict) -> str:
     return "(" + " OR ".join(clauses) + ")"
 
 
+# Total seconds spent in Python's garbage collector and the number of full (generation 2) collections,
+# measured with gc.callbacks. GC pauses happen inside the stages below, so the timer reports them
+# separately ("of which gc ...") rather than as a stage of their own.
+_GC = {"seconds": 0.0, "full": 0, "started": 0.0}
+
+
+def _gc_callback(phase: str, info: dict):
+    if phase == "start":
+        _GC["started"] = time.perf_counter()
+    else:
+        _GC["seconds"] += time.perf_counter() - _GC["started"]
+        if info.get("generation") == 2:
+            _GC["full"] += 1
+
+
+if _gc_callback not in gc.callbacks:
+    gc.callbacks.append(_gc_callback)
+
+
 class _Timer:
     """Wall time per sync stage, so slow syncs can be diagnosed from the logs.
 
@@ -446,6 +466,7 @@ class _Timer:
         self.queries = self.interval_queries = 0
         self.slowest_query = self.interval_slowest = 0.0
         self.start = self.interval_start = time.perf_counter()
+        self.gc_start = self.interval_gc = (_GC["seconds"], _GC["full"])
 
     def add(self, stage: str, seconds: float):
         self.total[stage] += seconds
@@ -458,17 +479,21 @@ class _Timer:
         self.slowest_query = max(self.slowest_query, seconds)
         self.interval_slowest = max(self.interval_slowest, seconds)
 
-    def _format(self, stages: dict, wall: float, queries: int, slowest: float) -> str:
+    def _format(self, stages: dict, wall: float, queries: int, slowest: float, gc_since: tuple) -> str:
         parts = ", ".join(f"{s} {stages[s]:.1f}s" for s in self.STAGES)
         other = wall - sum(stages.values())
         average = stages["query"] / queries if queries else 0.0
+        gc_seconds, gc_full = _GC["seconds"] - gc_since[0], _GC["full"] - gc_since[1]
         return (f"{wall:.1f}s wall = {parts}, other {other:.1f}s; "
-                f"{queries} queries, avg {average:.2f}s, slowest {slowest:.2f}s")
+                f"{queries} queries, avg {average:.2f}s, slowest {slowest:.2f}s; "
+                f"of which gc {gc_seconds:.1f}s ({gc_full} full collections)")
 
     def report_interval(self, label: str):
         now = time.perf_counter()
         log.info(f"{self.key}: timing ({label}): "
-                 + self._format(self.interval, now - self.interval_start, self.interval_queries, self.interval_slowest))
+                 + self._format(self.interval, now - self.interval_start, self.interval_queries, self.interval_slowest,
+                                self.interval_gc))
+        self.interval_gc = (_GC["seconds"], _GC["full"])
         self.interval = dict.fromkeys(self.STAGES, 0.0)
         self.interval_queries = 0
         self.interval_slowest = 0.0
@@ -476,7 +501,7 @@ class _Timer:
 
     def report_total(self, label: str):
         log.info(f"{self.key}: timing ({label}): "
-                 + self._format(self.total, time.perf_counter() - self.start, self.queries, self.slowest_query))
+                 + self._format(self.total, time.perf_counter() - self.start, self.queries, self.slowest_query, self.gc_start))
 
 
 def _read_rows(conn, spec: dict, order_columns: list, conditions: list, params: dict, after, timer: _Timer):
