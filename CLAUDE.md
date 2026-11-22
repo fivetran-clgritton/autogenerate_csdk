@@ -153,14 +153,40 @@ Test with the same steps IRIS used: small edge-case tables in a separate schema 
 
 ## Parallel work (one agent per database)
 
-After IRIS, each remaining SQL connector is ported by its own Claude session in its own git worktree (`~/wt-<db>`, i.e. `/home/CLAbeel/wt-<db>`, branch `<db>-general`; `/opt/sdk-test-dbs` is root-owned). Start it with `tmux new -s <db> 'cd ~/wt-<db> && claude'`. Rules:
+After IRIS, each remaining connector is ported by its own Claude session in its own git worktree (`~/wt-<db>`, i.e. `/home/CLAbeel/wt-<db>`, branch `<db>-general`; `/opt/sdk-test-dbs` is root-owned).
+
+**Starting the agents:** `bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh exasol mimer cubrid h2` (any subset; `geode` once one SQL port is done). It creates missing worktrees, fast-forwards untouched ones to `fix-db-seeding`, and starts each agent in a tmux session named after the database with the prompt "Do your porting task" (see **Porting tasks** below). Attach with `tmux attach -t <db>`; list with `tmux ls`. Re-running it skips sessions that already exist.
+
+Rules:
 
 - **Own one database.** Only touch your connector directory and your database. Test tables go in a schema of your own (e.g. `FTTest`). Do not reseed or change the seeded `customers` / `orders`.
 - **Never run `seed_all.sh`** while other agents are working: it resets the main checkout and reloads data under other agents' tests. Ask the user.
-- **Check `free -g` before a full sync** of the 11M-row tables and do not start one with less than 8 GB available. Peak-memory numbers are only meaningful when no other full sync is running; note in your results whether one was.
+- **One full 11M-row sync at a time, VM-wide.** Run it under the shared lock so agents queue instead of overlapping: `flock /home/CLAbeel/.full-sync.lock fivetran debug ...` (it waits until the previous holder finishes). Also check `free -g` first and do not start with less than 8 GB available. Small edge-case runs need no lock.
 - **Run `fivetran debug` from your worktree** (or a scratch copy) so the `files/warehouse.db` output is yours. Keep config/state files with passwords in your session scratchpad, never in the repo.
 - **Record results in `<db>/NOTES.md`**, not in this file: what was tested, numbers, quirks found. CLAUDE.md is merged once at the end.
 - **Commit and push your branch**; the user opens the PRs.
+
+## Porting tasks
+
+If you were started in `~/wt-<db>` and asked to "do your porting task", this is it. Your database is the one in the worktree's name (`git branch --show-current` gives `<db>-general`).
+
+1. Read **Connector Requirements**, **Porting the IRIS template** and **Parallel work** above, then `iris/connector.py` in full.
+2. Explore your database's catalog and driver behaviour with small queries (types returned for every column type, ordering quirks, how keyset comparisons behave on string keys).
+3. Rewrite `<db>/connector.py`, `configuration.json` (placeholders only) and `requirements.txt` (pinned versions) from the IRIS template.
+4. Test like IRIS: edge-case tables in your own test schema (string PK, composite PK, a table without a PK that must be skipped with a warning, nullable cursor with NULLs, every column type the database has); a second sync after add/drop column + update + delete; a `cursor_overrides` strategy change; a resume from a hand-written `after` position; a multi-batch run with a scratch copy set to `BATCH_SIZE = 2` and tied cursor values.
+5. Full sync of the seeded `customers` / `orders` under the lock (see **Parallel work**) with `--naming SOURCE` and `PYTHONUNBUFFERED=1`, then a content comparison against the source: counts, distinct ids, sums, min/max timestamps, per-status counts, a 2,000-row field-by-field sample per table.
+6. Run `/evaluate-connector` and fix required issues.
+7. Write `<db>/NOTES.md` (what was tested, timings and peak memory, quirks, open questions), commit, push `<db>-general`, and tell the user what is left.
+
+Stop and ask the user before anything outside your database: reseeding, container restarts, compose changes, firewall changes.
+
+| DB | Notes |
+|----|-------|
+| exasol | Catalog: `EXA_ALL_TABLES` / `EXA_ALL_COLUMNS` / `EXA_ALL_CONSTRAINT_COLUMNS`. Unquoted names are upper-cased (seeded schema `TESTDB`). pyexasol needs `fetch_mapper=pyexasol.exasol_mapper` and `validate_certificate=false`; port 8563. Compare pyexasol's streamed result handle against `LIMIT` batches on memory and time. |
+| mimer | Catalog: `INFORMATION_SCHEMA`. Needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts` and `libmimerapi.so` on the loader path; `connect(dsn="mimerdb")`. Seeded tables live in the `SEEDDB` databank. No `IF NOT EXISTS`. Use `FETCH FIRST n ROWS ONLY`; try mimerpy's server cursor. The native client library needs the SDK's custom-driver mechanism to deploy; note what that would take. |
+| cubrid | Catalog: `db_class` / `db_attribute` / `db_index`. JDBC via jaydebeapi with `/opt/sdk-test-dbs/jars/cubrid_jdbc.jar` and `PYTHONPATH=~/connector-deps`. Use `LIMIT`; test the JDBC fetch size for streaming. Java is needed in production (custom drivers). Open question from earlier: one run reported 9,548 upserts instead of 9,989. |
+| h2 | Catalog: H2 2.x `INFORMATION_SCHEMA`. jaydebeapi with `/opt/sdk-test-dbs/jars/h2.jar` (must match server 2.1.214); database `test`, port 9092. Test `LAZY_QUERY_EXECUTION=1` against `LIMIT` batches. |
+| geode | Not SQL: regions from the dev REST API (port 8081), fields by sampling entries, OQL with no `OFFSET` and no working `bind-values`. The primary key is the region key. Apply the requirements where they fit and record where they don't. Start after one SQL port is done. |
 
 ## Connector Code
 
