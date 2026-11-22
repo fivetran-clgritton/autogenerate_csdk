@@ -264,13 +264,12 @@ def _discover(conn, configuration: dict, verbose: bool = True) -> list:
     for schema_name in sorted({s for s, _ in selected}):
         _load_schema_catalog(conn, schema_name, columns, primary_keys, indexed)
 
-    specs, no_primary_key = [], []
+    specs, no_primary_key, skipped = [], [], []
     for schema_name, table_name in selected:
         key = (schema_name, table_name)
         table_columns = columns.get(key, [])
         if not table_columns:
-            if verbose:
-                op.warning(f"{schema_name}.{table_name}: no columns found in the catalog; table skipped")
+            skipped.append(f"{schema_name}.{table_name} (no columns in the catalog)")
             continue
         if not primary_keys.get(key):
             # Not supported yet: without a key, Fivetran hashes every value into _fivetran_id, which
@@ -286,8 +285,7 @@ def _discover(conn, configuration: dict, verbose: bool = True) -> list:
         }
         unkeyable = [c["name"] for c in table_columns if c["name"] in spec["primary_key"] and c["type"] in UNKEYABLE_TYPES]
         if unkeyable:
-            if verbose:
-                op.warning(f"{_table_key(spec)}: primary key column(s) {', '.join(unkeyable)} cannot be used for paging; table skipped")
+            skipped.append(f"{_table_key(spec)} (primary key column {', '.join(unkeyable)} cannot be used for paging)")
             continue
         spec["cursor"] = _choose_cursor(spec, cursor_candidates, overrides, verbose)
         if verbose and spec["cursor"] and (schema_name, table_name, spec["cursor"]["name"]) not in indexed:
@@ -298,6 +296,9 @@ def _discover(conn, configuration: dict, verbose: bool = True) -> list:
         spec["fetch_size"], spec["row_cap"] = _batch_limits(table_columns)
         specs.append(spec)
 
+    # One warning per kind: the dashboard keeps at most 10 per sync
+    if verbose and skipped:
+        op.warning(f"{len(skipped)} tables skipped: {', '.join(skipped[:20])}" + (f" and {len(skipped) - 20} more" if len(skipped) > 20 else ""))
     if verbose and no_primary_key:
         shown = ", ".join(no_primary_key[:20]) + (f" and {len(no_primary_key) - 20} more" if len(no_primary_key) > 20 else "")
         op.warning(f"{len(no_primary_key)} tables skipped because they have no primary key: {shown}")
@@ -1011,10 +1012,14 @@ def update(configuration: dict, state: dict):
             table_state = _table_state(spec, tables_state.get(key))
             tables_state[key] = table_state
             log.info(f"{key}: table {number} of {len(specs)}")
-            if spec["cursor"]:
-                _sync_incremental(conn, spec, table_state, state)
-            else:
-                _sync_full(conn, spec, table_state, state)
+            try:
+                if spec["cursor"]:
+                    _sync_incremental(conn, spec, table_state, state)
+                else:
+                    _sync_full(conn, spec, table_state, state)
+            except jpype.JException as exc:
+                # The next sync resumes this table from its last checkpoint
+                raise RuntimeError(f"{key}: CUBRID error: {exc.getMessage()}") from exc
     finally:
         conn.close()
 
