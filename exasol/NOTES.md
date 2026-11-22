@@ -104,6 +104,38 @@ lower-case quoted columns, a `TIMESTAMP WITH LOCAL TIME ZONE` cursor), plus `Col
 | Wrong password; closed port | Immediate clear failure; 3 attempts with backoff, then a clear failure |
 | Resume query log | Keyset values replaced by `<after the last row delivered>` (primary keys can be personal data) |
 
+## Test scenarios (small fixture, 2026-11-22)
+
+Run with `exasol/scenarios.py` (usage in its docstring; about 1 minute, no lock). It rebuilds
+`FTTEST.CUSTOMERS` (seeded ids <= 1,000) and `FTTEST.ORDERS` (ids <= 10,000) from the seeded tables,
+syncs with `include_tables=CUSTOMERS,ORDERS`, and after every scenario compares every row and column of
+the destination with the source and checks the upsert count against the rows `cursor >= saved cursor`
+selects. Scenarios 7 and 12 run patched copies of the connector so they are deterministic. Largest
+sync: 11,000 rows, peak 43 MB.
+
+| # | Scenario | Result |
+|---|---|---|
+| 1 | Initial sync | Pass: 11,000 upserts; every field equal |
+| 2 | 500 new orders | Pass: 502 upserts (500 + 1 boundary row per table) |
+| 3 | 100 updates, all with the same new `updated_at` | Pass: new amounts in the destination |
+| 4 | 50 soft deletes (`status = 'cancelled'`) | Pass |
+| 5 | 10 hard deletes | Known gap: the rows stay in the destination, not flagged deleted (cursor-based sync can't see deletes) |
+| 6 | Outage: closed port, then a 200-row backlog | Pass: clear failure after 3 attempts, state file unchanged; next sync picked up all 200 |
+| 7 | Mid-sync failure: crash injected after 5 checkpoints of 1,000 rows (3,000 orders in), 300 rows inserted, then resume | Pass: `fivetran debug` kept the last checkpoint in the state file; resume continued from the saved `after` position and upserted 7,991; destination equals source, no duplicates |
+| 8 | Add `DISCOUNT_PCT DECIMAL(5,2)`, set on 100 rows | Pass: column appears, values on those rows, NULL elsewhere; drift warning |
+| 9 | Add `NOTES`, sync, drop it, sync | Pass: drop logged, sync continues. The destination keeps the column; rows re-synced after the drop have NOTES set to NULL (their earlier values are overwritten) |
+| 10 | 5 rows with 850,000-character text (multi-byte characters) | Pass: compared in full; the wide column switches the table to 100-row fetches |
+| 11 | 20 rows at exactly the saved cursor value | Pass: all 20 picked up (`>=`) |
+| 12 | Writes from a second connection between the 2nd and 3rd query of a 3,000-row sync | Pass, with a known gap. Rows updated after being read were re-read later in the same sync; rows updated before being read were read once with new values; new rows arrived. Rows updated with an **old** `updated_at` (a late commit below the cursor) are never picked up |
+
+Known gaps (cursor-based sync, by design): hard deletes; rows written with a timestamp below the
+saved cursor; a new column with a `DEFAULT` that fills existing rows without bumping `updated_at`
+(existing rows get the value only when they next change; the drift warning says to re-sync).
+
+Found and fixed while running them: the destination-name collision check looked at every table in
+a selected schema, not only the selected tables, so `FTTEST.COLCOLLIDE` produced a warning even when
+`include_tables` left it out. A table that is selected is still skipped with the warning.
+
 ## Full initial sync (seeded `TESTDB`: 1M customers, 10M orders)
 
 Run under the shared lock with `--naming SOURCE` and `PYTHONUNBUFFERED=1`, at 5M rows per query:
@@ -163,7 +195,8 @@ Run under the shared lock with `--naming SOURCE` and `PYTHONUNBUFFERED=1`, at 5M
   `ROWS_PER_QUERY` with table size (`EXA_ALL_TABLES.TABLE_ROW_COUNT` is available), trading it
   against how long a server-side result stays open.
 - No `configuration_form` (optional, and the IRIS template has none either).
-- The 12 test scenarios in `test_scenarios.sql` have not been run.
+- The 12 test scenarios pass on the small fixture (see **Test scenarios**). Hard deletes and late
+  commits with old timestamps are not captured by any cursor-based sync.
 - `/evaluate-connector`: no required SDK violations remain. Issues it raised and that are fixed:
   keyset values in logs, connection retry and clear errors, destination-name collisions. Remaining
   good-to-have items: a setup form, and long functions (`_discover`, `_read_rows`).

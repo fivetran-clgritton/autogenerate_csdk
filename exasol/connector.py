@@ -308,8 +308,8 @@ def _colliding_tables(selected: list, columns: dict) -> set:
         groups.setdefault((_destination_name(schema_name), _destination_name(table_name)), []).append(
             f"{schema_name}.{table_name}")
     colliding = {name for names in groups.values() if len(names) > 1 for name in names}
-    for (schema_name, table_name), table_columns in columns.items():
-        destination = [_destination_name(c["name"]) for c in table_columns]
+    for schema_name, table_name in selected:
+        destination = [_destination_name(c["name"]) for c in columns.get((schema_name, table_name), [])]
         if len(set(destination)) < len(destination):
             colliding.add(f"{schema_name}.{table_name}")
     return colliding
