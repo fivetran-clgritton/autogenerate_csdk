@@ -71,10 +71,10 @@ services:
       - geode-data:/data
     command: >
       bash -c "
-        gfsh start locator --name=locator1 --port=10334 --bind-address=0.0.0.0 --dir=/data/locator &&
+        rm -f /data/locator/*.pid /data/server/*.pid && gfsh start locator --name=locator1 --port=10334 --dir=/data/locator &&
         sleep 10 &&
         gfsh -e 'connect --locator=localhost[10334]'
-             -e 'start server --name=server1 --server-port=40404 --bind-address=0.0.0.0 --dir=/data/server --J=-Dgemfire.start-dev-rest-api=true --J=-Dgemfire.http-service-port=8081 --J=-Dgemfire.http-service-bind-address=0.0.0.0' &&
+             -e 'start server --name=server1 --server-port=40404 --dir=/data/server --J=-Dgemfire.start-dev-rest-api=true --J=-Dgemfire.http-service-port=8081 --J=-Dgemfire.http-service-bind-address=0.0.0.0' &&
         tail -f /data/locator/locator1.log
       "
     restart: unless-stopped
@@ -103,9 +103,13 @@ services:
 
   h2:
     image: oscarfonts/h2:latest
+    environment:
+      # H2 2.x refuses to create a database over a remote (TCP) connection without this
+      H2_OPTIONS: "-ifNotExists"
     ports:
-      - "9092:9092"           # TCP server (use this in connectors)
-      - "8082:8082"           # web console
+      # The oscarfonts/h2 image listens on 1521 (TCP) and 81 (web console) inside the container
+      - "9092:1521"           # TCP server (use this in connectors, port 9092 on the host)
+      - "8082:81"             # web console
     volumes:
       - h2-data:/opt/h2-data
     restart: unless-stopped

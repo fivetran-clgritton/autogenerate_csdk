@@ -46,10 +46,17 @@ def order_rows(n=ORD_COUNT):
                created + timedelta(hours=random.randint(0, 72)))
 
 
-def insert_batches(cursor, sql, generator, total, label):
+def jdbc_row(row):
+    """jaydebeapi can't bind Python datetimes; send them as timestamp strings."""
+    return tuple(v.strftime("%Y-%m-%d %H:%M:%S") if isinstance(v, datetime) else v for v in row)
+
+
+def insert_batches(cursor, sql, generator, total, label, convert=None):
     batch = []
     done = 0
     for row in generator(total):
+        if convert:
+            row = convert(row)
         batch.append(row)
         if len(batch) >= BATCH:
             cursor.executemany(sql, batch)
@@ -100,10 +107,11 @@ def seed_vertica(host, password):
 # ── InterSystems IRIS ──────────────────────────────────────────────────────────
 def seed_iris(host, password):
     import sqlalchemy
-    engine = sqlalchemy.create_engine(
-        f"iris://_SYSTEM:{password}@{host}:1972/USER",
-        connect_args={"timeout": 30}
-    )
+    # URL.create keeps '@' etc. in the password intact; an f-string URL breaks on it.
+    url = sqlalchemy.engine.URL.create(
+        "iris", username="_SYSTEM", password=password,
+        host=host, port=1972, database="USER")
+    engine = sqlalchemy.create_engine(url, connect_args={"timeout": 30})
     with engine.begin() as conn:
         conn.execute(sqlalchemy.text("""
             CREATE TABLE IF NOT EXISTS SQLUser.customers (
@@ -123,6 +131,11 @@ def seed_iris(host, password):
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )"""))
+
+    # Start from empty tables so a re-run after a partial failure can't hit primary-key conflicts.
+    with engine.begin() as conn:
+        conn.execute(sqlalchemy.text("TRUNCATE TABLE SQLUser.customers"))
+        conn.execute(sqlalchemy.text("TRUNCATE TABLE SQLUser.orders"))
 
     # Insert in batches using raw connection
     raw = engine.raw_connection()
@@ -182,15 +195,19 @@ def seed_voltdb(host, password):
 # ── H2 ─────────────────────────────────────────────────────────────────────────
 def seed_h2(host):
     import jaydebeapi, os, urllib.request
-    jar = "/opt/h2-data/h2.jar"
+    # The client jar must match the server (the oscarfonts/h2 container ships 2.1.214).
+    jar = os.environ.get("H2_JAR", "/opt/h2-data/h2-2.1.214.jar")
     if not os.path.exists(jar):
-        os.makedirs("/opt/h2-data", exist_ok=True)
+        os.makedirs(os.path.dirname(jar), exist_ok=True)
         print("Downloading H2 jar...")
         urllib.request.urlretrieve(
-            "https://repo1.maven.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.jar", jar)
+            "https://repo1.maven.org/maven2/com/h2database/h2/2.1.214/h2-2.1.214.jar", jar)
+    # Host 9092 maps to the container's 1521. The server runs with -baseDir /opt/h2-data and
+    # -ifNotExists, so the database name is relative to that directory.
     conn = jaydebeapi.connect("org.h2.Driver",
-                              f"jdbc:h2:tcp://{host}:9092//opt/h2-data/test",
+                              f"jdbc:h2:tcp://{host}:9092/test",
                               ["sa", ""], jar)
+    conn.jconn.setAutoCommit(False)
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (
@@ -202,10 +219,12 @@ def seed_h2(host):
             id INT PRIMARY KEY, customer_id INT, amount DECIMAL(10,2),
             status VARCHAR(20), created_at TIMESTAMP, updated_at TIMESTAMP
         )""")
+    cur.execute("TRUNCATE TABLE customers")
+    cur.execute("TRUNCATE TABLE orders")
     insert_batches(cur, "INSERT INTO customers VALUES (?,?,?,?,?,?)",
-                   customer_rows, CUST_COUNT, "customers")
+                   customer_rows, CUST_COUNT, "customers", convert=jdbc_row)
     insert_batches(cur, "INSERT INTO orders VALUES (?,?,?,?,?,?)",
-                   order_rows, ORD_COUNT, "orders")
+                   order_rows, ORD_COUNT, "orders", convert=jdbc_row)
     conn.commit()
     conn.close()
     print("H2 seeded.")
@@ -213,8 +232,13 @@ def seed_h2(host):
 
 # ── CUBRID ──────────────────────────────────────────────────────────────────────
 def seed_cubrid(host, password):
-    import CUBRIDdb
-    conn = CUBRIDdb.connect(f"CUBRID:{host}:33000:testdb:::", "dba", password)
+    # CUBRID-Python (C extension) fails on Python 3.14 with "Invalid connection handle",
+    # so go through the JDBC driver instead (seed_all.sh copies the jar out of the container).
+    import jaydebeapi, os
+    jar = os.environ.get("CUBRID_JDBC_JAR", "/opt/sdk-test-dbs/jars/cubrid_jdbc.jar")
+    conn = jaydebeapi.connect("cubrid.jdbc.driver.CUBRIDDriver",
+                              f"jdbc:cubrid:{host}:33000:testdb:::", ["dba", password], jar)
+    conn.jconn.setAutoCommit(False)
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (
@@ -226,10 +250,12 @@ def seed_cubrid(host, password):
             id INT PRIMARY KEY, customer_id INT, amount NUMERIC(10,2),
             status VARCHAR(20), created_at DATETIME, updated_at DATETIME
         )""")
+    cur.execute("TRUNCATE TABLE customers")
+    cur.execute("TRUNCATE TABLE orders")
     insert_batches(cur, "INSERT INTO customers VALUES (?,?,?,?,?,?)",
-                   customer_rows, CUST_COUNT, "customers")
+                   customer_rows, CUST_COUNT, "customers", convert=jdbc_row)
     insert_batches(cur, "INSERT INTO orders VALUES (?,?,?,?,?,?)",
-                   order_rows, ORD_COUNT, "orders")
+                   order_rows, ORD_COUNT, "orders", convert=jdbc_row)
     conn.commit()
     conn.close()
     print("CUBRID seeded.")
@@ -238,19 +264,33 @@ def seed_cubrid(host, password):
 # ── Mimer ───────────────────────────────────────────────────────────────────────
 def seed_mimer(host, password):
     import mimerpy
-    conn = mimerpy.connect(dsn=f"{host}:1360", user="SYSADM", password=password)
+    conn = mimerpy.connect(dsn="mimerdb", user="SYSADM", password=password)
     conn.autocommit = True
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS SYSADM.customers (
+    # Mimer has no CREATE TABLE IF NOT EXISTS (IF is a reserved word), so check the catalog first.
+    # SYSADM has no default databank, so tables go explicitly IN SEEDDB (the built-in transaction databank).
+    cur.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.EXT_DATABANKS WHERE DATABANK_NAME = 'SEEDDB'")
+    if cur.fetchone()[0] == 0:
+        cur.execute("CREATE DATABANK SEEDDB")
+
+    def create_if_missing(table, ddl):
+        cur.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                    "WHERE TABLE_SCHEMA = 'SYSADM' AND TABLE_NAME = ?", (table.upper(),))
+        if cur.fetchone()[0] == 0:
+            cur.execute(ddl)
+
+    create_if_missing("customers", """
+        CREATE TABLE SYSADM.customers (
             id INTEGER PRIMARY KEY, name NVARCHAR(100), email NVARCHAR(200),
             created_at TIMESTAMP(6), updated_at TIMESTAMP(6), status NVARCHAR(20)
-        )""")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS SYSADM.orders (
+        ) IN SEEDDB""")
+    create_if_missing("orders", """
+        CREATE TABLE SYSADM.orders (
             id INTEGER PRIMARY KEY, customer_id INTEGER, amount DECIMAL(10,2),
             status NVARCHAR(20), created_at TIMESTAMP(6), updated_at TIMESTAMP(6)
-        )""")
+        ) IN SEEDDB""")
+    cur.execute("DELETE FROM SYSADM.customers")
+    cur.execute("DELETE FROM SYSADM.orders")
     # Mimer doesn't support executemany well; use autocommit + individual inserts in batches
     insert_batches(cur, "INSERT INTO SYSADM.customers VALUES (?,?,?,?,?,?)",
                    customer_rows, CUST_COUNT, "customers")
@@ -277,6 +317,8 @@ def create_geode_regions():
     cmd = ["docker", "exec", names[0], "gfsh", "-e", "connect --locator=localhost[10334]"]
     for region in ("customers", "orders"):
         cmd += ["-e", f"create region --name={region} --type=REPLICATE_PERSISTENT --if-not-exists"]
+        # Start empty so re-runs don't leave stale or stray entries behind
+        cmd += ["-e", f"remove --region=/{region} --all"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"gfsh region creation failed:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")

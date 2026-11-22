@@ -26,6 +26,8 @@ The API connectors (AfterShip, EasyPost, Rillet, Omnia, Jobber, Moz, Degreed, La
 | `/opt/sdk-test-dbs/docker-compose.yml` | The compose file the running containers come from. It is a **separate copy**, not this repo's `docker-compose.yml` (container names differ, e.g. `exasol` vs `connectors-exasol-1`). Port or flag changes made in the repo copy must be applied here by hand. Never run `docker compose` from the repo directory — it creates a second project with blank passwords. |
 | `/opt/sdk-test-dbs/.env` | `VERTICA_PASS`, `CUBRID_PASS`, `MIMER_PASS` used by compose |
 | `/opt/sdk-test-dbs/venv` | Python 3.14 venv (3.14 built from source; Debian only ships 3.11) |
+| `/opt/sdk-test-dbs/jars` | `cubrid_jdbc.jar` and `h2.jar`, copied out of the containers by `seed_all.sh` (JDBC seeders and connectors use them) |
+| `/opt/sdk-test-dbs/sqlhosts` | Mimer client SQLHOSTS file (`MIMER_SQLHOSTS`), written by `seed_all.sh` |
 | `/mnt/data/<service>` | Container data (500GB SSD) |
 
 ## GCP Test Infrastructure
@@ -72,7 +74,7 @@ gcloud config set project internal-sales
 |----------|-------|--------|
 | InterSystems IRIS Community | 1972, portal 52773 | Running |
 | Exasol | 8563 (unencrypted — used by seeder and connector), 9563 (TLS) | Running |
-| Apache Geode | 10334 locator / 40404 server / 7070 locator HTTP / 8081 dev REST (pending, see below) | Running |
+| Apache Geode | 10334 locator / 40404 server / 7070 locator HTTP / 8081 dev REST | Running |
 | CUBRID | 33000 | Running |
 | Mimer SQL | 1360 | Running |
 | H2 | 9092 TCP, 8082 web console | Running |
@@ -100,20 +102,106 @@ sudo bash /opt/sdk-test-dbs/connectors/seed_all.sh iris cubrid   # any subset; n
   source /opt/sdk-test-dbs/venv/bin/activate
   python /opt/sdk-test-dbs/connectors/seed_data.py --db h2 --host localhost --customers 1000 --orders 10000
   ```
-- Only Exasol truncates before loading. The other SQL seeders have primary keys, so after a partial failure truncate the tables before re-running.
+- Every seeder clears its tables/regions before loading, so re-running after a partial failure is safe (a failed run on a big load can take a while to clear).
 
-### Seeding status (2026-11-20)
+### Seeding status (2026-11-21)
 
-| DB | Status | Notes |
-|----|--------|-------|
-| Exasol | Seeded, **probably twice** | It ran twice before the TRUNCATE fix and has no primary key. Re-run `seed_all.sh exasol` to reload cleanly. |
-| IRIS | Failed: Access Denied | The failing run probably used an older `seed_all.sh` with the pre-portal password. Retry first. |
-| CUBRID | Failed: Invalid connection handle | The newest `CUBRID-Python` (9.3.0.2) predates Python 3.14. Options: a separate Python 3.11 venv for CUBRID, or the CUBRID JDBC driver via jaydebeapi (Java is installed for H2). The connection-string fix (`CUBRID:host:33000:testdb:::`) has not run yet. |
-| Mimer | Failed: `libmimerapi.so` not found | `seed_all.sh` copies it from `/usr/lib` or `/usr/local/lib` in the container — unverified; locate it with `docker exec mimer find / -name 'libmimerapi*'`. `CREATE TABLE IF NOT EXISTS` support in Mimer is also unverified. |
-| Geode | Failed: connection refused on 7070 | The dev REST API was moved to 8081 because the locator in the same container owns 7070. Apply the new `geode` command and port mapping from the repo compose to the VM compose file, then `docker compose up -d geode`. Regions are created with gfsh via `docker exec`; the multi-key PUT loader has only been tested against a fake server. |
-| H2 | Failed: EOFException on 9092 | The JDBC URL fix (`jdbc:h2:tcp://host:9092//opt/h2-data/test`) has not run yet. Check that the container's H2 version matches the 2.2.224 client jar; H2 2.x also refuses remote database creation unless started with `-ifNotExists`. |
-| Vertica | Not running | Needs Docker Hub login |
-| VoltDB | Skipped | No free license |
+All six databases are seeded: 1M customers / 10M orders each, except Geode (100K / 1M). Row counts were checked directly in each database.
+
+| DB | Notes |
+|----|-------|
+| Exasol | Reloaded cleanly (truncates first); no duplicate ids. |
+| IRIS | The password contains `@`, so the seeder builds the URL with `sqlalchemy.engine.URL.create` (an f-string URL breaks the sqlalchemy-iris dialect). |
+| CUBRID | CUBRID-Python fails on Python 3.14 ("Invalid connection handle"), so seeder and connector use the JDBC jar via jaydebeapi. The compose `CUBRID_PASSWORD` env var does **not** set the `dba` password; it was empty until set with `csql ... ALTER USER dba PASSWORD ...`. If the container is rebuilt, set it again. |
+| Mimer | The client resolves the database name (`mimerdb`) through an SQLHOSTS file, not host:port. `libmimerapi.so` is a symlink inside the container (copy the real file under `/opt/mimersqlsrv*/lib`). There is no `CREATE TABLE IF NOT EXISTS` (`IF` is reserved), and `SYSADM` has no default databank, so tables live in a `SEEDDB` databank the seeder creates. |
+| Geode | Persistent regions need persistent PDX metadata or every REST write fails with a misleading "Json doc ... invalid" 400. Fixed with `configure pdx --disk-store --read-serialized=true` (stored in cluster config). Do not pass `--bind-address=0.0.0.0` to the locator or server (JGroups rejects it and the container crash-loops). The compose command removes stale `.pid` files so restarts work. |
+| H2 | The `oscarfonts/h2` image listens on 1521 (TCP) and 81 (web) inside the container, so compose maps `9092:1521` and `8082:81`, and runs with `-ifNotExists`. The client jar must match the server (2.1.214). Database name is `test` (relative to the server's baseDir). |
+| Vertica | Not running; needs Docker Hub login |
+| VoltDB | Skipped (no free license); the container crash-loops |
+
+Seeders for IRIS, CUBRID, Mimer, H2 and Geode now clear their tables/regions before loading, so re-runs are safe.
+
+## Connector Requirements
+
+These are **general connectors** for customers running these databases, not harnesses for the seeded test data. Every connector must meet these requirements (decided 2026-11-21):
+
+1. **Discover tables and columns from the database catalog.** Never hardcode table names, column lists, primary keys or cursor columns. Use the source's catalog: `INFORMATION_SCHEMA` (IRIS, Mimer, H2), `EXA_ALL_TABLES` / `EXA_ALL_COLUMNS` / `EXA_ALL_CONSTRAINT_COLUMNS` (Exasol), `db_class` / `db_attribute` / `db_index` (CUBRID), the region list from the dev REST API (Geode, sampling entries for fields), and so on for new databases.
+2. **Let the user scope the sync.** Configuration should allow selecting schemas and including or excluding tables (flat string values, e.g. comma-separated lists, per the SDK's `configuration.json` rules). Exclude system schemas by default.
+3. **Take primary keys from the catalog. Sync only tables that have one** (decided 2026-11-22, first pass). Skip tables without a primary key and list them in one `op.warning`. Without a key, Fivetran hashes every value into `_fivetran_id`, which makes upserts slow and collapses exact-duplicate rows (IRIS test: 5 source rows became 2). Support for them may come later.
+4. **Choose a sync strategy per table.**
+   - **Incremental:** when a usable cursor column exists (configurable, defaulting to a convention such as `updated_at`). Read `cursor >= last value` with keyset paging on `(cursor, primary key)`.
+   - **Full reload:** for tables with no usable cursor. Use `op.truncate(table, deferred=True)` and then upsert every row, so a failed sync deletes nothing.
+5. **Avoid unbounded reads of large tables.** This is a guideline, not a hard rule. A single unbounded `SELECT *` over tens or hundreds of millions of rows is usually a bad pattern, so prefer bounded batches (`TOP n` / `LIMIT n` / `FETCH FIRST n`) continuing after the last `(cursor, pk)` delivered. Decide per database: some drivers stream a single query well with server-side cursors, others buffer client-side. Check memory with a full sync of the 10M-row orders table in the stress-test stage, which comes last (see **Test order**). Example: the IRIS driver grew memory linearly (2.4 GB after 6M rows) on one streamed query and would have hit the 4 GB limit that `fivetran debug` and production enforce, so IRIS uses batches.
+   - **Server-side cursors are a good pattern where the database supports them.** The reference is the Redshift `large_data_volume` connector in `fivetran/community_connectors` (`redshift/large_data_volume/redshift_client.py`): `BEGIN`, `DECLARE <name> NO SCROLL CURSOR FOR <query>`, a loop of `FETCH <n> FROM <name>`, then `CLOSE` and `COMMIT`. The database holds the result set, the client holds one batch, and there is no repeated per-batch sort. Where a driver exposes the equivalent natively (a server-side result-set handle, a JDBC fetch size, lazy query execution), that counts too, but verify it with a memory check.
+   - For very large incremental tables, the same connector **chunks** the cursor. It finds an upper bound with `ORDER BY rk LIMIT 1 OFFSET chunk_size-1`, declares a cursor over `rk > bookmark AND rk <= upper_bound`, and checkpoints `upper_bound` after each chunk. The `<=` keeps all rows with the boundary value in one chunk, so ties are safe and each transaction stays bounded. (Its extra row-count checkpoints inside a chunk use the last row's value with `>`, which can skip ties on resume. Don't copy that part.)
+   - The same connector is also the reference for discovery: `information_schema` tables, columns and primary keys, replication-key inference from column types, include/exclude projection, full-resync fallback, and parallel tables through a connection pool.
+   - Unverified per-database notes, to check during the full-sync memory tests: Exasol (pyexasol reads through a server-side result handle in chunks), IRIS (SQL `DECLARE CURSOR` may exist only in embedded SQL; also test the raw DB-API cursor without SQLAlchemy), H2 (materializes results unless `LAZY_QUERY_EXECUTION=1`), CUBRID (JDBC fetch size), Mimer (mimerpy server cursor), Vertica (streams natively).
+6. **Checkpoint cadence bounds memory.** The SDK buffers upserted rows in memory until the next `op.checkpoint()` flushes them, so memory scales with the rows between checkpoints, not with table size. Measured with a database-free test connector (2M rows): one checkpoint at the end peaked at 3.5 GB; every 60 s peaked at 1.4 GB; every 10,000 rows peaked at 290 MB. The SDK reference says to checkpoint no more than once a minute, which doesn't account for this. Checkpoint on **whichever comes first: about 60 s or a row cap** (~100k rows, lower for wide rows), plus at the end of each table. A mid-table checkpoint stores the keyset position so a resume is exact. (IRIS with 60 s only peaked at 2.54 GB on the full sync; with a 100k-row cap it peaked at 1.99 GB.)
+7. **Handle schema drift:** pick up new columns and cope with dropped ones without failing the sync. Declare column types only where a type must be forced (e.g. `DECIMAL` precision/scale, `UTC_DATETIME`), so the SDK can infer the rest and evolve the schema.
+8. **Follow the SDK reference** in the `fivetran-connector-sdk` Claude Code plugin (https://github.com/fivetran/connector_sdk_tools, installed on the VM). In particular: call `op.*` directly (never `yield`), run `/evaluate-connector` before calling a connector done, and keep dependencies the Fivetran runtime lacks (Java/JDBC jars, native client libraries) in mind. Those need the SDK's custom-driver mechanism (`drivers/installation.sh`, Private Preview) or a pure-Python driver.
+
+**Current state (2026-11-22):** IRIS meets requirements 1-7 and is the template (see **Porting the IRIS template**). It passed edge-case tests (string/composite keys, keyless table skipped, every column type, NULL cursors, add/drop column, update, delete, strategy change, resume from a saved position, multi-batch paging with tied cursor values) and a full initial sync of 1M customers + 10M orders (29 min, peak 1.99 GB, `--naming SOURCE`) with a content comparison against the source: counts, distinct ids, column sums, min/max timestamps, per-status counts and a 2,000-row field-by-field sample per table. The 12 test scenarios have not been run yet (they now come before stress testing; see **Test order**). The other connectors are still hardcoded to `customers` / `orders` with `id` / `updated_at` (Geode reads regions from config and samples one entry).
+
+## Porting the IRIS template
+
+`iris/connector.py` is the reference implementation of the requirements above. Database-specific parts are marked `IRIS:`; everything else should carry over with little change. To port it:
+
+1. **Catalog queries** (`_discover`, `_load_schema_catalog`): base tables, columns (name, type, precision, scale, nullable), primary-key columns in key order, and leading index columns (for the "cursor not indexed" warning). Exclude system schemas by default (`SYSTEM_SCHEMAS`, `SYSTEM_SCHEMA_PREFIXES`); a schema listed in `schemas` is synced even if it is a system schema.
+2. **Type sets** (`TIMESTAMP_TYPES`, `DECIMAL_TYPES`, ...): map the catalog's type names. Declare in `schema()` only DECIMAL (precision/scale, max 38), timestamps (`NAIVE_DATETIME` unless the type carries a zone, then `UTC_DATETIME`), dates, booleans and binary. Everything else is inferred.
+3. **Batched reads** (`_read_rows`): `TOP n` becomes `LIMIT n` / `FETCH FIRST n ROWS ONLY` as the dialect needs. `_keyset_condition` expands `(a, b) > (x, y)` into OR/AND form, so it works without row-value comparison. Or replace batching with a server-side cursor where the driver supports one (requirement 5), and verify memory with the full sync.
+4. **Driver quirks**: IRIS returns ordered columns in an internal form unless cast (`_select_expr`). Check your driver: select a timestamp, date and numeric column while ordering by it and look at the Python types that come back.
+5. **Tables without a primary key** are skipped (requirement 3), so every keyset is (cursor, primary key) or the primary key alone; no row-id paging is needed.
+6. **Keep unchanged**: config keys (`schemas`, `include_tables`, `exclude_tables`, `cursor_columns`, `cursor_overrides`), state layout (`{"tables": {"<schema>.<table>": {"mode", "cursor_column", "cursor", "after", "columns"}}}`), `schema=` on every operation, checkpoint cadence (60 s or row cap), deferred truncate for full reloads (not re-issued on resume), NULL-cursor re-send, strategy-change reset, drift warnings.
+
+Test with the same steps IRIS used: small edge-case tables in a separate schema (string PK, composite PK, no PK (must be skipped with a warning), nullable cursor with NULLs, every column type), a second sync after add/drop column + update + delete, a `cursor_overrides` strategy change, a resume from a hand-written `after` position. Then run the 12 test scenarios on the small fixture (see **Test Scenarios**), run `/evaluate-connector`, and only then the stress test (see **Test order**).
+
+## Parallel work (one agent per database)
+
+After IRIS, each remaining connector is ported by its own Claude session in its own git worktree (`~/wt-<db>`, i.e. `/home/CLAbeel/wt-<db>`, branch `<db>-general`; `/opt/sdk-test-dbs` is root-owned).
+
+**Starting the agents:** `bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh exasol mimer cubrid h2` (any subset; `geode` once one SQL port is done). It creates missing worktrees, fast-forwards untouched ones to `fix-db-seeding`, and starts each agent in a tmux session named after the database with the prompt "Do your porting task" (see **Porting tasks** below). Attach with `tmux attach -t <db>`; list with `tmux ls`. Re-running it skips sessions that already exist.
+
+**Operator steps (for the user):**
+
+1. In a shell on the VM (inside tmux is fine), run `bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh exasol mimer cubrid h2`.
+2. Visit each session once to answer Claude's "trust this folder" prompt: inside tmux, `Ctrl-b s`, pick the session, Enter; outside tmux, `tmux attach -t <db>`. Leave with `Ctrl-b d` (detach; the agent keeps running).
+3. Agents may pause for tool-permission prompts or questions; check each session now and then (`Ctrl-b s`). `Ctrl-b [` scrolls back (`q` to leave).
+4. Disconnecting SSH does not stop them. To come back: SSH in, `tmux ls`, `tmux attach -t <db>`.
+5. Results: `<db>/NOTES.md` and commits on `<db>-general` (`git -C ~/wt-<db> log --oneline fix-db-seeding..`).
+6. If an agent's Claude has exited, the session shows a shell: run `claude "Do your porting task"` in it. To start a session over: `tmux kill-session -t <db>` and re-run the script.
+7. Start `geode` the same way once one SQL port is done.
+
+Rules:
+
+- **Own one database.** Only touch your connector directory and your database. Test tables go in a schema of your own (e.g. `FTTest`). Do not reseed or change the seeded `customers` / `orders`.
+- **Never run `seed_all.sh`** while other agents are working: it resets the main checkout and reloads data under other agents' tests. Ask the user.
+- **The lock is for stress tests only.** A full 11M-row sync runs under the shared lock so agents queue instead of overlapping: `flock /home/CLAbeel/.full-sync.lock fivetran debug ...` (it waits until the previous holder finishes). Check `free -g` first and do not start with less than 8 GB available. Edge-case tests and the 12 scenarios use small tables (seconds per sync, well under 300 MB) and run without the lock, in parallel across databases.
+- **Run `fivetran debug` from your worktree** (or a scratch copy) so the `files/warehouse.db` output is yours. Keep config/state files with passwords in your session scratchpad, never in the repo.
+- **Record results in `<db>/NOTES.md`**, not in this file: what was tested, numbers, quirks found. CLAUDE.md is merged once at the end.
+- **Commit and push your branch**; the user opens the PRs.
+
+## Porting tasks
+
+If you were started in `~/wt-<db>` and asked to "do your porting task", this is it. Your database is the one in the worktree's name (`git branch --show-current` gives `<db>-general`).
+
+1. Read **Connector Requirements**, **Porting the IRIS template** and **Parallel work** above, then `iris/connector.py` in full.
+2. Explore your database's catalog and driver behaviour with small queries (types returned for every column type, ordering quirks, how keyset comparisons behave on string keys).
+3. Rewrite `<db>/connector.py`, `configuration.json` (placeholders only) and `requirements.txt` (pinned versions) from the IRIS template.
+4. Test like IRIS: edge-case tables in your own test schema (string PK, composite PK, a table without a PK that must be skipped with a warning, nullable cursor with NULLs, every column type the database has); a second sync after add/drop column + update + delete; a `cursor_overrides` strategy change; a resume from a hand-written `after` position; a multi-batch run with a scratch copy set to `BATCH_SIZE = 2` and tied cursor values.
+5. Run the 12 test scenarios on the small fixture in your test schema (see **Test Scenarios**). No lock needed.
+6. Run `/evaluate-connector` and fix required issues; re-run the scenarios after any fix.
+7. Write `<db>/NOTES.md` (what was tested, per-scenario results, quirks, open questions), commit, push `<db>-general`, and tell the user what is left.
+8. **Stress test, last, and only once all 12 scenarios pass:** full sync of the seeded `customers` / `orders` under the lock (see **Parallel work**) with `--naming SOURCE` and `PYTHONUNBUFFERED=1`, then a content comparison against the source: counts, distinct ids, sums, min/max timestamps, per-status counts, a 2,000-row field-by-field sample per table. Add timings and peak memory to `NOTES.md`, commit and push.
+
+Stop and ask the user before anything outside your database: reseeding, container restarts, compose changes, firewall changes.
+
+| DB | Notes |
+|----|-------|
+| exasol | Catalog: `EXA_ALL_TABLES` / `EXA_ALL_COLUMNS` / `EXA_ALL_CONSTRAINT_COLUMNS`. Unquoted names are upper-cased (seeded schema `TESTDB`). pyexasol needs `fetch_mapper=pyexasol.exasol_mapper` and `validate_certificate=false`; port 8563. Compare pyexasol's streamed result handle against `LIMIT` batches on memory and time. |
+| mimer | Catalog: `INFORMATION_SCHEMA`. Needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts` and `libmimerapi.so` on the loader path; `connect(dsn="mimerdb")`. Seeded tables live in the `SEEDDB` databank. No `IF NOT EXISTS`. Use `FETCH FIRST n ROWS ONLY`; try mimerpy's server cursor. The native client library needs the SDK's custom-driver mechanism to deploy; note what that would take. |
+| cubrid | Catalog: `db_class` / `db_attribute` / `db_index`. JDBC via jaydebeapi with `/opt/sdk-test-dbs/jars/cubrid_jdbc.jar` and `PYTHONPATH=~/connector-deps`. Use `LIMIT`; test the JDBC fetch size for streaming. Java is needed in production (custom drivers). Open question from earlier: one run reported 9,548 upserts instead of 9,989. |
+| h2 | Catalog: H2 2.x `INFORMATION_SCHEMA`. jaydebeapi with `/opt/sdk-test-dbs/jars/h2.jar` (must match server 2.1.214); database `test`, port 9092. Test `LAZY_QUERY_EXECUTION=1` against `LIMIT` batches. |
+| geode | Not SQL: regions from the dev REST API (port 8081), fields by sampling entries, OQL with no `OFFSET` and no working `bind-values`. The primary key is the region key. Apply the requirements where they fit and record where they don't. Start after one SQL port is done. |
 
 ## Connector Code
 
@@ -122,19 +210,51 @@ One directory per connector in this repo (`<name>/connector.py`, `configuration.
 | Connector | Driver | Sync strategy | Status |
 |-----------|--------|---------------|--------|
 | vertica | vertica-python | cursor on updated_at | Not yet run against a real DB |
-| iris | sqlalchemy-iris | cursor on updated_at | Not yet run against a real DB |
-| exasol | pyexasol | cursor on updated_at | Not yet run against a real DB |
+| iris | sqlalchemy-iris | catalog discovery; incremental on `updated_at` (configurable) or full reload | General connector; edge-case tests + full initial sync with content comparison passed (2026-11-22); 12 scenarios not yet run |
+| exasol | pyexasol | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
 | voltdb | requests (REST) | cursor on updated_at | SKIPPED |
-| geode | requests (REST, port 8081) | cursor on updated_at | Not yet run against a real DB |
-| cubrid | CUBRID-Python | cursor on updated_at | Not yet run against a real DB |
-| mimer | mimerpy | cursor on updated_at | Not yet run against a real DB |
-| h2 | jaydebeapi + JPype1 | cursor on updated_at | Not yet run against a real DB |
+| geode | requests (REST + OQL, port 8081) | cursor on updated_at | Smoke-tested: small incremental sync + one full initial sync, row counts match (2026-11-21) |
+| cubrid | jaydebeapi + JPype1 (CUBRID JDBC) | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
+| mimer | mimerpy | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
+| h2 | jaydebeapi + JPype1 | cursor on updated_at | Smoke-tested only: small incremental sync, row counts match (2026-11-21) |
 
-`fivetran debug` has so far only been run from cloud sessions, which cannot reach the databases.
+`fivetran debug` has been run on the VM for `iris`, `exasol`, `mimer`, `geode`, `cubrid` and `h2` (incremental from a late cursor: 9,989 rows each for the SQL databases; Geode's smaller dataset gives 985). Geode also had a full initial sync (100,000 customers / 1,000,000 orders, about 6 minutes, peak 393 MB). `vertica` has not run (no instance) and `voltdb` is skipped.
+
+**What "smoke-tested" does and does not mean.** Each connector connects, builds its schema and upserts a small slice (rows updated after late Dec 2024) with counts matching the database. Not yet tested for any connector: a full initial sync of the 11M-row tables (only Geode's 1.1M had one), content/type fidelity beyond row counts, resume after a mid-sync failure, deletes, schema drift (schemas are hardcoded), concurrent writes. Do not call a connector "working" until it passes a full initial sync with a content comparison and the test scenarios. Open question: CUBRID's first run reported 9,548 upserts instead of 9,989; not reproducible, cause unknown.
+
+Running `fivetran debug` on the VM:
+- The `fivetran` CLI uses system Python 3.11 and does not install connector requirements. Install JDBC deps without root: `/usr/bin/python3 -m pip install --target ~/connector-deps jaydebeapi JPype1`, then run with `PYTHONPATH=~/connector-deps`.
+- Use a scratch config/state file instead of editing `configuration.json`, so real passwords stay out of the repo. `debug` writes the final checkpoint back to the `--state` file.
+- For long runs use `PYTHONUNBUFFERED=1` when redirecting output to a file (otherwise the log lags by minutes) and `--naming SOURCE`: the local debug runner re-normalizes every column name on every row, which was ~40% of sync time in a profile and does not happen in production. Column names that are already lowercase snake_case come out the same either way.
+- Connectors log a timing breakdown every 250k rows and per table (`query`, `fetch`, `convert`, `upsert`, `checkpoint`). IRIS full sync of orders (10M rows): upsert 38%, query 22% (no index on `updated_at`, so each 50k batch re-scans and sorts the remaining rows, ~1.8 s), fetch 13%, convert 13%, checkpoint 13%. Fetch and convert time per row doubled over the run while process memory grew to ~2 GB. Cause confirmed with `gc.callbacks` timing (now in the log as "of which gc"): about 16 full collections per 250k rows throughout, each slower as the heap grows, so GC time per 250k rows rose from 1.3 s to 6.2 s by 4M rows. The connector holds at most one batch; the growth is most likely the debug runner (it keeps a set of every upserted key for the whole sync), so production may not see it. Not mitigated in the connector (no `gc.freeze()` / threshold changes).
+- Pass timestamps and dates to `op.upsert` as `datetime`/`date` objects, not ISO strings: the SDK re-parses strings with `strptime` (~13% of sync time in a profile).
+- Seeded data is dated 2022-2024. To test without syncing 11M rows, start from a late cursor, e.g. `{"customers_cursor": "2024-12-30 12:00:00", "orders_cursor": "2024-12-31 12:00:00"}`.
+- The SDK requires `DECIMAL` columns to declare `precision`/`scale` in `schema()`, `DECIMAL` values as `str`/`int`, and `UTC_DATETIME` values as ISO 8601 with a zone. `schema()` returns a list of dicts (`{"table", "primary_key", "columns": {name: type}}`); there is no `SchemaBuilder` or `DataType`. `op.upsert` takes one record dict, not a list. `vertica` and `voltdb` were written against the same wrong API and will need the same treatment.
+- Connector-specific gotchas found while debugging:
+  - IRIS: selecting `updated_at` while also `ORDER BY updated_at` returns an internal sort-encoded value (e.g. `'1154657064703846976'`), so the connector selects `CAST(updated_at AS TIMESTAMP)`.
+  - Exasol: unquoted identifiers are upper-cased, so the schema is `TESTDB`; pyexasol returns timestamps as strings unless `fetch_mapper=pyexasol.exasol_mapper`; set `validate_certificate` to `false` for the self-signed test cert.
+  - Mimer: needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts` and `libmimerapi.so` on the loader path; `connect(dsn=...)` takes the database name (`mimerdb`), not host:port.
+  - Geode: OQL has no `OFFSET` and the dev REST API's `bind-values` does not work, so the connector pages by keyset on `updated_at` and validates the cursor before putting it in the query. The old key-scan fallback used a wrong URL and silently returned zero rows, so it was removed (failures now surface).
+- All connectors read with `updated_at >= cursor` (not `>`): rows sharing the cursor timestamp are never skipped on resume or with concurrent writes, and primary-key upserts make the re-read harmless.
+
+## Test order
+
+Decided 2026-11-22: **prove correctness on small data first, stress-test last.**
+
+1. Edge-case tests (see **Porting the IRIS template**).
+2. The 12 test scenarios below, on a small fixture. Each sync takes seconds, so the whole set can be re-run after every connector change, and databases run in parallel without the lock.
+3. Stress test: the full 1M + 10M-row sync of the seeded tables under the lock, with peak memory and a content comparison. Only after all 12 scenarios pass.
+
+Exasol, Mimer, CUBRID and H2 already ran the stress test (before this order was set); their next step is the scenarios.
 
 ## Test Scenarios
 
-12 scenarios in `test_scenarios.sql` (this repo):
+The 12 scenarios are listed in `test_scenarios.sql` (this repo). That file is written at full size against the seeded `orders`: **do not run it against the seeded tables.** Run the scaled-down versions below against a fixture in your own test schema.
+
+**Fixture:** in your test schema, `customers` = seeded rows with `id <= 1000` and `orders` = seeded rows with `id <= 10000` (`CREATE TABLE ... AS SELECT`, then a primary key on `id`). The seeded tables are only read. The fixture is identical in every database, so expected results are the same everywhere. Recreate it before each full run of the scenarios. Point the connector at it with `schemas` set to your test schema and `include_tables` set to `customers,orders`.
+
+**Check after every scenario:** compare the whole destination with the source (the fixture is small enough for a full field-by-field comparison): row counts, no duplicate primary keys, every column of every row equal, except where the scenario expects a difference.
+
 1. Initial sync baseline
 2. Incremental — new rows
 3. Incremental — updates
@@ -147,6 +267,25 @@ One directory per connector in this repo (`<name>/connector.py`, `configuration.
 10. Large payload rows
 11. Cursor boundary fence-post
 12. Concurrent writes during sync
+
+Scaled-down versions (sync = `fivetran debug` re-using the saved state, unless noted):
+
+| # | Change on the fixture | Expected |
+|---|---|---|
+| 1 | Initial sync from empty state | 1,000 + 10,000 rows, every field equal |
+| 2 | Insert 500 orders (ids 10001-10500) with `updated_at` after the saved cursor | All 500 arrive; only those plus the boundary rows (`>=`) are re-read |
+| 3 | Update `amount` on 100 orders and bump `updated_at` | New values in the destination; count unchanged |
+| 4 | Set `status = 'cancelled'` on 50 orders and bump `updated_at` | Status updated in the destination |
+| 5 | Hard-delete 10 orders | Still in the destination (cursor-based sync can't see deletes). Record as a known gap, not a failure |
+| 6 | Outage: sync with the port pointed at a closed port, then insert 200 orders, then sync normally | First sync fails with a clear error and leaves state unchanged; the second picks up all 200, no duplicates. No container stops |
+| 7 | Mid-sync failure: from empty state, run a scratch copy with a small checkpoint row cap (e.g. 1,000) that raises after a few checkpoints; then resume with the real connector | Resume completes; destination equals source, no duplicates |
+| 8 | Add a nullable `discount_pct DECIMAL(5,2)`, set it on 100 orders and bump their `updated_at` | Column appears; values on those rows, NULL elsewhere |
+| 9 | Add a `notes VARCHAR` column, sync, then drop it and sync | No failure; drift warning logged |
+| 10 | Add a large text column and insert 5 orders with ~1 MB values | Values arrive intact (compare length and hash) |
+| 11 | Insert 20 orders with `updated_at` exactly equal to the saved cursor value | All 20 arrive on the next sync |
+| 12 | Concurrent writes: run a scratch copy with a small batch size and a short sleep per batch, and insert/update rows from a second connection while it runs; then sync again | After the follow-up sync the destination equals the source |
+
+Record a pass/fail row per scenario in `<db>/NOTES.md`, with counts and anything the connector does by design.
 
 ## Infrastructure Reference
 
@@ -174,11 +313,19 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 | `DOCKER_HUB_USER` | Docker Hub username (for pulling `vertica/vertica-ce`) |
 | `DOCKER_HUB_TOKEN` | Docker Hub personal access token |
 
+## Handoff / current state (2026-11-22)
+
+- Work is on branch `fix-db-seeding` (pushed; several commits on top of `main`). **The PR is not open yet**: the GitHub token on the VM can push but lacks Pull requests write. Open it at https://github.com/fivetran-clgritton/autogenerate_csdk/pull/new/fix-db-seeding. `seed_all.sh` resets to `origin/main`, so use `SEED_SKIP_UPDATE=1` until it is merged.
+- VM state outside the repo: `gh` installed and logged in; git identity set in this checkout; JDBC/driver deps for `fivetran debug` in `~/connector-deps` (use `PYTHONPATH=~/connector-deps`); VM compose backup at `/opt/sdk-test-dbs/docker-compose.yml.bak-20261120233821`; Geode PDX persistence configured in its cluster config; Mimer `SEEDDB` databank created; CUBRID `dba` password set.
+- Scratch `fivetran debug` config/state files live in each session's scratchpad and are lost between sessions. Recreate them from the password table above, outside the repo. IRIS state is `{"tables": {"<schema>.<table>": {...}}}` (see the porting guide); the old connectors use Geode `{"<region>": {"last_updated_at": "<ISO ts>"}}`, Exasol `{"<table>": {"updated_at": "..."}}`, the rest `{"<table>_cursor": "..."}`. Mimer also needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts`.
+- IRIS has a test schema `FTTest` (tables `typesdemo`, `compositepk`, `nopk`) used for the edge-case tests; it is not part of the seeded data.
+- Two GitHub PATs were pasted into the previous session's transcript; the user was asked to revoke them.
+
 ## Next Steps
 
-1. Reload Exasol cleanly, then get IRIS, CUBRID, Mimer, Geode and H2 seeded (see the status table)
-2. Run `fivetran debug` for each connector on the VM against `localhost`
-3. Run the test scenarios against each connector
-4. Get Vertica running (Docker Hub login)
+1. Port the IRIS template to Exasol, Mimer, CUBRID and H2 (one agent per database, see **Parallel work**), then Geode.
+2. Run the 12 test scenarios against each connector on the small fixture (see **Test Scenarios**; 7, 11 and 12 exercise the `>=` cursor change). No lock; databases in parallel.
+3. Stress test last, once the scenarios pass: full initial sync per connector (one at a time, under the lock; the 10M-row orders table is where memory/speed problems will show), with a content comparison against the source, not just counts. Exasol, Mimer, CUBRID and H2 have already done this.
+4. Get Vertica running (Docker Hub login), then port its connector to the current SDK API (it uses the same nonexistent APIs the others did)
 5. Move credentials out of the repo and rotate them
 6. `fivetran deploy` to a Fivetran workspace for end-to-end testing

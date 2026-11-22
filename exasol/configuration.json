@@ -1,7 +1,8 @@
 {
   "host": "<VM_STATIC_IP>",
-  "port": "9563",
+  "port": "8563",
   "username": "sys",
   "password": "<EXASOL_PASSWORD>",
-  "schema": ""
+  "schema": "testdb",
+  "validate_certificate": "false"
 }

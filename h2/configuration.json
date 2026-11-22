@@ -3,5 +3,5 @@
   "port": "9092",
   "username": "sa",
   "password": "",
-  "database": "~/test"
+  "database": "test"
 }

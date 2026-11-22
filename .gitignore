@@ -222,6 +222,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# fivetran debug output
+files/
+crash-reports/
 # Claude Code worktree metadata
 .claude/
 

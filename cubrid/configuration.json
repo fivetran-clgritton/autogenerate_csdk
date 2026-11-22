@@ -3,5 +3,6 @@
   "port": "33000",
   "database": "testdb",
   "username": "dba",
-  "password": "<CUBRID_PASS>"
+  "password": "<CUBRID_PASS>",
+  "jdbc_jar": "/opt/sdk-test-dbs/jars/cubrid_jdbc.jar"
 }
