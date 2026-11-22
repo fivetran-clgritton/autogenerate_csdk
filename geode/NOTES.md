@@ -152,7 +152,28 @@ the saved cursor; a new field added to existing entries without bumping the curs
 
 ## Full initial sync (seeded `customers` 100k, `orders` 1M)
 
-STRESS_RESULTS
+Run under the shared lock with `--naming SOURCE` and `PYTHONUNBUFFERED=1` (2026-11-22), from empty
+state, `include_tables=customers,orders`:
+
+- **SYNC SUCCEEDED: 1,100,000 upserts in 3 min 45 s, 13 checkpoints. Peak memory 571 MB** (SDK report;
+  average 438 MB). The old hardcoded connector took about 6 minutes and 393 MB for the same data.
+- `customers` (100k): 14.9 s = query 1.0 s, fetch 4.6 s, convert 0.4 s, upsert 6.3 s, checkpoint 2.0 s;
+  2 ordered queries.
+- `orders` (1M): 199.7 s = query 57.6 s (11 ordered queries of 100k, avg 5.2 s, slowest 8.6 s), fetch
+  46.6 s (about 2,000 value queries), convert 4.5 s, upsert 62.7 s, checkpoint 20.1 s; GC 9.9 s. About
+  50 s per 250k rows throughout; no slowdown over the run.
+- Content comparison (`geode/compare_full_sync.py`): **all checks passed** for both regions.
+  - Counts, `_fivetran_deleted` all false, distinct ids, distinct keys.
+  - Sums: `id`, `customer_id`, `amount` (2,499,456,336.75, summed exactly on both sides).
+  - Min, max and non-null count of `created_at` and `updated_at`.
+  - Per-status counts.
+  - A 2,000-row field-by-field sample per region, 0 mismatches.
+- Geode's own OQL `sum()` over the `amount` doubles returns 2,499,456,260.00, which is wrong by 76.75
+  (it loses precision). The exact sum of every source value equals the destination's, and the sorted
+  list of all 1M source amounts equals the destination's. The comparison script sums doubles in
+  Python for that reason.
+- A follow-up sync from the saved state re-read only the entry at each cursor value (2 upserts) in
+  11.5 s, most of it the two sampling queries (the recent-entries sample sorts `orders`).
 
 ## Open questions / not tested
 

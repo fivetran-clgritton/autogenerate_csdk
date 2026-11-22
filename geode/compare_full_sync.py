@@ -57,10 +57,15 @@ def main():
         check("distinct ids", oql(f"SELECT count(DISTINCT e.value.id) FROM /{region}.entrySet e")[0], distinct_ids)
         check("distinct keys", src_count, distinct_keys)
         for field in spec["sums"]:
-            source = oql(f"SELECT sum(e.value.{field}) AS s FROM /{region}.entrySet e")[0]
-            dest = dst.execute(f'SELECT SUM("{field}") FROM {ref}').fetchone()[0]
-            if field == "amount":  # doubles: compare at cent precision
-                source, dest = Decimal(str(source)).quantize(Decimal("0.01")), Decimal(str(dest)).quantize(Decimal("0.01"))
+            if field == "amount":
+                # Doubles: Geode's OQL sum() loses precision (2,499,456,260.00 for an exact 2,499,456,336.75 on
+                # the seeded orders), so sum every value exactly on both sides
+                source = sum(Decimal(repr(v)) for v in oql(f"SELECT e.value.{field} FROM /{region}.entrySet e"))
+                dest = sum(Decimal(repr(r[0])) for r in dst.execute(f'SELECT "{field}" FROM {ref}').fetchall())
+            else:
+                source = oql(f"SELECT sum(e.value.{field}) AS s FROM /{region}.entrySet e")[0]
+                source = source["s"] if isinstance(source, dict) else source
+                dest = dst.execute(f'SELECT SUM("{field}") FROM {ref}').fetchone()[0]
             check(f"sum({field})", source, dest)
         for field in spec["timestamps"]:
             row = oql(f"SELECT min(e.value.{field}) AS lo, max(e.value.{field}) AS hi FROM /{region}.entrySet e")[0]
