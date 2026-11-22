@@ -1,7 +1,8 @@
 # Mimer SQL connector: porting notes (2026-11-22)
 
 `mimer/connector.py` is a general connector ported from the IRIS template. It meets Connector
-Requirements 1-7 in CLAUDE.md. The 12 test scenarios in `test_scenarios.sql` have not been run.
+Requirements 1-7 in CLAUDE.md. It passed the edge-case tests, the full 11M-row sync with a content
+comparison, and the 12 test scenarios on the small fixture (`mimer/scenarios.py`). Not deployed yet.
 
 ## Design
 
@@ -101,6 +102,51 @@ attributed to the debug runner's set of upserted keys. For comparison, IRIS took
 took 5.7-10 s (a re-sort of the remaining rows every time), against a single 21 s sort for the whole
 table with the server cursor.
 
+## Test scenarios (2026-11-22)
+
+`mimer/scenarios.py` runs the 12 scaled-down scenarios from CLAUDE.md ("Test Scenarios"), modelled on
+`exasol/scenarios.py`. It rebuilds the fixture in `FTTest` (customers `id <= 1000`, orders
+`id <= 10000`, copied from the seeded `SYSADM` tables, which are only read) and runs `fivetran debug`
+on a copy of the connector after each change. After every scenario it compares the whole destination
+with the source, field by field. The whole run takes about 40 s (16 syncs of 1-4 s each). Run it with:
+
+```bash
+export PYTHONPATH=~/connector-deps LD_LIBRARY_PATH=/usr/local/lib
+/usr/bin/python3 mimer/scenarios.py --config <scratch config> --work <scratch dir>
+```
+
+The scratch config needs `host`, `port`, `database`, `username`, `password`. "Expected" upserts are
+the rows the source has at or after the saved cursor (`>=`), counted in the database before each sync.
+
+| # | Scenario | Result | Detail |
+|---|---|---|---|
+| 1 | Initial sync baseline | PASS | 11,000 upserts; 1,000 + 10,000 rows, every field equal |
+| 2 | 500 new orders | PASS | 502 upserts (500 + one boundary row per table) |
+| 3 | 100 updated amounts (one shared `updated_at`) | PASS | 601 upserts (expected 601: the 500 rows from step 2 share the old cursor value); new values in the destination, count unchanged |
+| 4 | 50 orders set to `cancelled` | PASS | 151 upserts; status updated |
+| 5 | 10 orders hard-deleted | PASS (known gap) | The 10 rows stay in the destination, not flagged deleted. A cursor-based sync cannot see deletes |
+| 6 | Outage (port 1), then 200 new orders | PASS | Failed in `schema()` within a second: `Cannot reach Mimer SQL at localhost:1: [Errno 111] Connection refused`; state file unchanged. The next sync: 251 upserts, no duplicates |
+| 7 | Mid-sync failure | PASS | Scratch copy with a 1,000-row checkpoint cap, raising after 5 checkpoints: 3,000 orders in the destination, state `after=['2022-12-09 12:50:00.000000', 6811]` (mid-table). 300 orders inserted before the resume; the real connector resumed (7,991 upserts) and the destination equals the source, no duplicates |
+| 8 | Add `discount_pct DECIMAL(5,2)`, set on 100 orders | PASS | 601 upserts (includes the 300 rows from step 7, which this destination had not seen); column appears, 100 rows have a value, NULL elsewhere |
+| 9 | Add `notes`, sync, drop it, sync | PASS | No failure. The drop is logged at info level: `columns no longer in the source: notes (kept in the destination; NULL in rows synced from now on)`. The 20 rows re-synced after the drop have `notes` NULL |
+| 10 | `payload NCLOB(4M)`, 5 orders with 1,000,000-1,000,004 characters (é, €, emoji) | PASS | Length and SHA-256 equal for all 5 |
+| 11 | 20 orders at exactly the saved cursor value | PASS | All 20 arrive (26 upserts) |
+| 12 | Writes on a second connection while the orders cursor is open | PASS (known gap) | Scratch copy with 500-row fetches (50 for LOB tables, which orders is after step 10) runs the writes after 2,001 rows. The sync upserted 3,026 rows, exactly the rows matching before the writes: the read-only transaction reads a snapshot, so none of the concurrent changes appear in that pass. The follow-up sync upserted 152 (50 moved-ahead rows already read, 50 not yet read, 50 new, 2 boundary rows); destination equals source except the known gap: 10 rows updated with an old `updated_at` (a late commit below the cursor) are missed |
+
+Findings while writing the scenarios (test side, not the connector):
+
+- **mimerpy cannot write NCLOB parameters over about 64k characters** (`-19118 Client and server
+  disagreed on LOB length`). `mimerSetNclobData8` passes the UTF-8 byte length to `MimerSetLob`
+  (Mimer expects characters for NCLOB) and sends the value in one call. `scenarios.py` replaces that
+  setter with a chunked one that passes the character count. Reading is unaffected: the connector
+  read the 1M-character values intact. CLOB parameters of 100k ASCII characters work.
+- **The test server allows two concurrent connections**: the third gets `-16218 Operation not
+  allowed. Configured number of users exceeded` (probably the Docker image's licence). The connector
+  uses one. `scenarios.py` closes its own connection during scenario 12. A customer's server could
+  have the same limit, in which case a sync needs a free slot.
+- Mimer has no `CREATE TABLE ... AS SELECT` (the fixture uses explicit DDL + `INSERT ... SELECT`),
+  `NVARCHAR` is at most 5,000 characters, and `||` does not accept an NCLOB operand.
+
 ## Deployment (not yet tried)
 
 - mimerpy 1.3.11 is pure Python (ctypes). It needs only the native `libmimerapi.so` (355 KB;
@@ -114,7 +160,6 @@ table with the server cursor.
 
 ## Open questions / not done
 
-- 12 test scenarios not run.
 - A full pass over one table is one read-only transaction (22 min for orders). Mimer handled it
   with concurrent writers in a small test; how a long snapshot affects a busy production server
   (old row versions kept) is unknown. The Redshift-style chunking (bounded transactions with an
@@ -125,7 +170,10 @@ table with the server cursor.
 - Also affects other connectors: the SDK infers a Python float as 32-bit FLOAT, so `DOUBLE` columns left
   undeclared lose precision or overflow to `inf`. IRIS does not declare its `double` columns and
   probably has the same problem (not checked).
-- Left in the database: schema `FTTest`, databank `FTTESTDB` (test only; drop with
+- Hard deletes and late commits with an old `updated_at` are not detected (scenarios 5 and 12; same as
+  every cursor-based connector here).
+- Left in the database: schema `FTTest` (edge-case tables plus the scenario fixture `customers` /
+  `orders`), databank `FTTESTDB` (test only; drop with
   `DROP DATABANK FTTESTDB CASCADE` and `DROP SCHEMA FTTest CASCADE` when done).
 
 ## Running it on the VM
