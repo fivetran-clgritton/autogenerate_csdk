@@ -8,8 +8,9 @@ against the `oscarfonts/h2` container (H2 2.1.214, database `test`, port 9092) o
 Meets Connector Requirements 1-7, passed the edge-case tests below, and passed a full initial sync
 of the seeded `PUBLIC.CUSTOMERS` (1M) and `PUBLIC.ORDERS` (10M) with a content comparison against
 the source (everything matched).
-The 12 test scenarios in `test_scenarios.sql` have not been run. Not deployed to Fivetran: the
-runtime has no Java (see **Deploying**).
+Passed the 12 test scenarios on the small fixture (see **Test scenarios**; 10 pass, 2 pass with the
+known gaps of a cursor-based sync). Not deployed to Fivetran: the runtime has no Java (see
+**Deploying**).
 
 ## How it differs from the IRIS template
 
@@ -146,6 +147,47 @@ values tied in groups of 3), `CUSTIDX` (1M-row copy of `PUBLIC.CUSTOMERS` with a
 | Resume from hand-written state (`after: [7]` on TIES, `after: ["EU","a","3"]` on COMPOSITEPK) | Exactly the 4 and 9 rows after the position |
 | Indexed cursor (CUSTIDX) | 1M-row initial sync 117 s, peak 508 MB; small delta and NULL rows through the cursor index; 200k-row delta in primary-key order |
 | Connection errors | Wrong database: fails at once with H2's message. Refused port: retried twice (10 s, 20 s), then fails |
+
+## Test scenarios (small fixture)
+
+Run with `h2/scenarios.py` (adapted from `exasol/scenarios.py`), 2026-11-22. The whole set takes
+87 s:
+
+    PYTHONPATH=~/connector-deps /usr/bin/python3 h2/scenarios.py --config <scratch>/config.json --work <scratch>/scenarios
+
+The config needs `host`, `port`, `database`, `username`, `password` and `jar_path`. Keep it outside
+the repo. The script rebuilds the fixture in `FTTEST`: `CUSTOMERS` is seeded ids <= 1,000 and
+`ORDERS` is seeded ids <= 10,000, built with `CREATE TABLE AS`, then `ID` set NOT NULL, then a
+primary key (H2's `CREATE TABLE AS` does not copy NOT NULL). Each sync is a `fivetran debug` run of
+a copy of `connector.py` with `--naming SOURCE`. After every scenario, every row and column of the
+destination is compared with the source: counts, duplicate keys, and every field typed (int,
+Decimal, timestamp, text).
+
+"Expected" upserts is the number of rows with `updated_at >=` the saved cursor (the previous
+high-water mark) or NULL, counted at the source just before the sync. Every incremental sync must
+read exactly that set.
+
+| # | Scenario | Result | Detail |
+|---|---|---|---|
+| 1 | Initial sync baseline | PASS | 11,000 upserts; 1,000 + 10,000 rows, every field equal |
+| 2 | Incremental: 500 new rows | PASS | 502 upserts (expected 502: the 500 rows plus one boundary row per table); 10,500 orders equal |
+| 3 | 100 updated rows (`amount`, one shared new `updated_at`) | PASS | 601 upserts (expected 601: the 500 rows of #2 sit at the old high-water mark and are re-read); count unchanged, new amounts in the destination |
+| 4 | Soft deletes: 50 rows set to `cancelled` | PASS | 151 upserts (expected 151); status updated |
+| 5 | Hard deletes: 10 rows | PASS (known gap) | 51 upserts (expected 51); the 10 deleted rows stay in the destination and are not flagged deleted. A cursor-based sync cannot see deletes |
+| 6 | Outage, then a 200-row backlog | PASS | Sync against port 1: two logged retries (10 s, 20 s), then fails with `Could not connect to H2 at jdbc:h2:tcp://localhost:1/test;IFEXISTS=TRUE: ... Connection is broken`, rc 1, state file unchanged. Then 251 upserts (expected 251); no duplicates. No container stopped |
+| 7 | Mid-sync failure and resume | PASS | Patched copy (checkpoint every 1,000 rows, raise after the 5th checkpoint), from empty state: crashed with 1,000 customers and 3,000 orders delivered; state mid-table (`after: ["3010"]` plus `high_water`; ids 251-260 are deleted, so the 3,000th row is id 3010). 300 rows inserted, then resumed with the real connector: "resuming incremental sync", 7,991 upserts (7,990 orders after id 3010 + 1 customer boundary row); 10,990 orders equal, no duplicates |
+| 8 | Add `DISCOUNT_PCT DECIMAL(5,2)`, set on 100 rows | PASS | 601 upserts (expected 601); column created as DECIMAL(5,2) with values on those rows and NULL elsewhere; `op.warning` "new columns DISCOUNT_PCT" |
+| 9 | Add `NOTES VARCHAR(500)` (10 rows set), sync, drop it, sync | PASS | 111 then 21 upserts (as expected); no failure; "columns no longer in the source: NOTES" logged; the destination keeps the column, and the 20 rows re-synced after the drop have NULL `NOTES` |
+| 10 | Large payloads: CLOB column, 5 rows of ~1 MB | PASS | 26 upserts (expected 26); 850,000 characters / 1,000,000 bytes UTF-8 each (with `é` and `€`), compared in full. The CLOB switches the table to the LOB batch size (1,000 rows per query) |
+| 11 | 20 rows at exactly the saved cursor | PASS | Saved cursor `2025-02-10 00:00:00` = source max; 26 upserts (expected 26), all 20 arrived |
+| 12 | Concurrent writes during a sync | PASS (known gap) | Patched copy: 1,000 rows per query; before the third `ORDERS` query a second connection updates 50 rows already read (ids 1001-1050), updates 50 not yet read (3901-3950), inserts 50 new rows (11201-11250), and updates 10 rows with an old `updated_at` (501-510, a "late commit"). After that sync (3,076 upserts): the rows not yet read and the new rows are current; the 50 rows updated behind the reader are stale, as designed. The follow-up sync (152 upserts) brings them current, since their new `updated_at` is above the high-water mark. Destination equals source except the 10 late-commit rows, which a cursor-based sync cannot see |
+
+Behaviour by design shown here:
+- A row updated behind the reader during a sync gets picked up by the next sync. The high-water mark
+  is taken when the pass starts, so any later write lands at or above it.
+- Re-reads at the boundary (`>=`) are harmless upserts.
+- Hard deletes and late commits with an old cursor value are not detected (gaps of any cursor-based
+  sync).
 
 ## Full initial sync of the seeded tables
 
