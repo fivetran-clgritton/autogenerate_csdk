@@ -114,9 +114,21 @@ sample per table.
 Effect of this round's fixes on speed: see **A/B timing** below. Memory is unaffected (the fixes add
 no per-row state).
 
-## A/B timing
+## A/B timing (2026-11-22)
 
-PENDING
+To decide whether the full stress test had to be repeated: an initial sync of the seeded
+`SQLUser.customers` (1M rows, `--naming SOURCE`, under the shared lock), alternating the connector
+before this round (`old`) and after it (`new`, which declares `name`, `email`, `status` as `STRING`):
+
+| Run | Elapsed | upsert | query | checkpoint | Peak memory |
+|---|---|---|---|---|---|
+| old | 1:49 | 55.8 s | 15.3 s | 17.5 s | 631 MB |
+| new | 1:48 | 56.1 s | 13.8 s | 17.3 s | 585 MB |
+| old | 1:47 | 55.6 s | 13.5 s | 17.3 s | 618 MB |
+| new | 1:47 | 55.8 s | 13.8 s | 17.3 s | 607 MB |
+
+No measurable difference in time or memory (GC identical: 7.3 s, 65 full collections each), so the
+29 min / 1.99 GB full sync above still stands and was not re-run.
 
 ## Quirks (IRIS)
 
