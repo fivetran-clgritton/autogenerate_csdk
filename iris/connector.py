@@ -17,6 +17,7 @@ are marked "IRIS:".
 """
 
 import gc
+import re
 import time
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
@@ -42,6 +43,9 @@ MIN_CHECKPOINT_ROW_CAP = 10_000
 LOB_BATCH_SIZE = 1_000
 LOB_CHECKPOINT_ROW_CAP = 10_000
 PROGRESS_LOG_EVERY = 250_000
+# Connection attempts before a sync fails; refused or dropped connections are retried, a refused login is not
+CONNECT_ATTEMPTS = 3
+CONNECT_RETRY_SECONDS = 5
 
 DEFAULT_CURSOR_COLUMNS = "updated_at"
 
@@ -56,7 +60,8 @@ DATE_TYPES = {"date"}
 TIME_TYPES = {"time"}
 INTEGER_TYPES = {"tinyint", "smallint", "integer", "int", "bigint"}
 DECIMAL_TYPES = {"numeric", "decimal"}
-FLOAT_TYPES = {"double", "float", "real"}
+FLOAT_TYPES = {"double", "float", "real"}  # IRIS: the catalog reports all three as double
+STRING_TYPES = {"varchar", "char", "longvarchar", "time"}  # TIME is delivered as an ISO string
 BOOLEAN_TYPES = {"bit"}
 BINARY_TYPES = {"binary", "varbinary", "longvarbinary"}
 LOB_TYPES = {"longvarchar", "longvarbinary"}
@@ -95,6 +100,31 @@ def _engine(configuration: dict):
         database=configuration.get("namespace") or "USER",
     )
     return create_engine(url)
+
+
+def _connect(engine, configuration: dict):
+    """Open a connection, retrying network failures, with an error that names the server."""
+    target = (f"{configuration['host']}:{configuration.get('port') or 1972}"
+              f"/{configuration.get('namespace') or 'USER'}")
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        try:
+            return engine.connect()
+        except Exception as e:  # IRIS: the driver raises a plain RuntimeError for connection failures
+            message = str(getattr(e, "orig", None) or e)
+            if "Access Denied" in message:
+                # IRIS: a wrong password, an unknown namespace and an unresolvable host all look like this
+                raise RuntimeError(
+                    f"IRIS at {target} refused the login for {configuration.get('username') or '_SYSTEM'} "
+                    f"(Access Denied): check the username, password, namespace and host. {message}"
+                ) from None
+            if attempt == CONNECT_ATTEMPTS:
+                raise RuntimeError(
+                    f"Could not connect to IRIS at {target} after {CONNECT_ATTEMPTS} attempts: {message}"
+                ) from None
+            delay = CONNECT_RETRY_SECONDS * 2 ** (attempt - 1)
+            log.warning(f"Connecting to IRIS at {target} failed (attempt {attempt} of {CONNECT_ATTEMPTS}), "
+                        f"retrying in {delay}s: {message}")
+            time.sleep(delay)
 
 
 def _quote(identifier: str) -> str:
@@ -168,9 +198,19 @@ def _discover(conn, configuration: dict, verbose: bool = True) -> list:
     for schema_name in sorted({s for s, _ in selected}):
         _load_schema_catalog(conn, schema_name, columns, primary_keys, indexed)
 
+    colliding = _colliding_tables(selected, columns)
+    if verbose and colliding:
+        shown = ", ".join(sorted(colliding)[:20]) + (f" and {len(colliding) - 20} more" if len(colliding) > 20 else "")
+        op.warning(
+            f"{len(colliding)} tables skipped because their schema, table or column names differ only in case or "
+            f"punctuation and would be merged in the destination: {shown}"
+        )
+
     specs, no_primary_key = [], []
     for schema_name, table_name in selected:
         key = (schema_name, table_name)
+        if f"{schema_name}.{table_name}" in colliding:
+            continue
         table_columns = columns.get(key, [])
         if not table_columns:
             if verbose:
@@ -201,6 +241,29 @@ def _discover(conn, configuration: dict, verbose: bool = True) -> list:
         op.warning(f"{len(no_primary_key)} tables skipped because they have no primary key: {shown}")
         log.info(f"Tables skipped for having no primary key: {', '.join(no_primary_key)}")
     return specs
+
+
+def _destination_name(name: str) -> str:
+    """Approximation of Fivetran's destination naming (lower snake_case, camelCase split, other
+    characters replaced by '_'), used only to detect names that would collide."""
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _colliding_tables(selected: list, columns: dict) -> set:
+    """'schema.table' names to skip: selected tables whose destination names collide with another
+    selected table, and tables with two columns whose destination names collide. IRIS: delimited
+    identifiers allow names such as "order-items" next to order_items, or "CamelCase" next to camel_case."""
+    groups = {}
+    for schema_name, table_name in selected:
+        groups.setdefault((_destination_name(schema_name), _destination_name(table_name)), []).append(
+            f"{schema_name}.{table_name}")
+    colliding = {name for names in groups.values() if len(names) > 1 for name in names}
+    for schema_name, table_name in selected:
+        destination = [_destination_name(c["name"]) for c in columns.get((schema_name, table_name), [])]
+        if len(set(destination)) < len(destination):
+            colliding.add(f"{schema_name}.{table_name}")
+    return colliding
 
 
 def _load_schema_catalog(conn, schema_name: str, columns: dict, primary_keys: dict, indexed: set):
@@ -292,13 +355,22 @@ def _batch_limits(columns: list):
 
 
 def _declared_type(column: dict):
-    """Type to declare in schema(), only where the SDK cannot infer it from the delivered value."""
+    """Type to declare in schema(), wherever the SDK would infer the wrong one from the delivered value.
+
+    Integers are left to inference. Floats and strings are not: the SDK infers an undeclared Python
+    float as a 32-bit FLOAT (3.141592653589793 arrived as 3.1415927, -1e300 as -inf), and an undeclared
+    string column from its content (VARCHAR 't' became BOOLEAN, '2024-01-01' DATE, '1.50' DOUBLE 1.5).
+    """
     data_type = column["type"]
     if data_type in DECIMAL_TYPES:
         precision = column["precision"]
         if precision and precision <= MAX_DECIMAL_PRECISION:
             return {"type": "DECIMAL", "precision": int(precision), "scale": int(column["scale"] or 0)}
-        return None  # delivered as a string
+        return "STRING"  # delivered as a string
+    if data_type in FLOAT_TYPES:
+        return "DOUBLE"
+    if data_type in STRING_TYPES:
+        return "STRING"
     if data_type in TIMESTAMP_TYPES:
         return "NAIVE_DATETIME"  # IRIS: TIMESTAMP has no time zone
     if data_type in DATE_TYPES:
@@ -739,7 +811,7 @@ def schema(configuration: dict):
     _validate_configuration(configuration)
     engine = _engine(configuration)
     try:
-        with engine.connect() as conn:
+        with _connect(engine, configuration) as conn:
             specs = _discover(conn, configuration, verbose=False)
     finally:
         engine.dispose()
@@ -751,7 +823,7 @@ def update(configuration: dict, state: dict):
     tables_state = state.setdefault("tables", {})
     engine = _engine(configuration)
     try:
-        with engine.connect() as conn:
+        with _connect(engine, configuration) as conn:
             specs = _discover(conn, configuration)
             if not specs:
                 op.warning("No tables matched the schemas / include_tables / exclude_tables settings")
