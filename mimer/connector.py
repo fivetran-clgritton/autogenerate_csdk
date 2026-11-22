@@ -203,7 +203,7 @@ def _set_array_size(cursor, rows: int):
     except Exception as exc:  # any failure here only costs speed
         if not _MIMER["array_size_warned"]:
             _MIMER["array_size_warned"] = True
-            log.warning(f"Could not set the Mimer fetch array size ({exc}); rows are fetched one per round trip")
+            op.warning(f"Could not set the Mimer fetch array size ({exc}); rows are fetched one per round trip")
 
 
 def _quote(identifier: str) -> str:
