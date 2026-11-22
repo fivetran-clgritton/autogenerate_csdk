@@ -1,3 +1,1 @@
-jaydebeapi>=1.2.3
-JPype1>=1.4.1
-fivetran_connector_sdk
+JPype1==1.7.1

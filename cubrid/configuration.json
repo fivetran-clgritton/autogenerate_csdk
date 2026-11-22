@@ -1,8 +1,13 @@
 {
-  "host": "<VM_STATIC_IP>",
+  "host": "CUBRID_HOST",
   "port": "33000",
-  "database": "testdb",
-  "username": "dba",
-  "password": "<CUBRID_PASS>",
-  "jdbc_jar": "/opt/sdk-test-dbs/jars/cubrid_jdbc.jar"
+  "database": "CUBRID_DATABASE",
+  "username": "CUBRID_USER",
+  "password": "CUBRID_PASSWORD",
+  "jdbc_jar": "/opt/sdk-test-dbs/jars/cubrid_jdbc.jar",
+  "schemas": "",
+  "include_tables": "",
+  "exclude_tables": "",
+  "cursor_columns": "updated_at",
+  "cursor_overrides": ""
 }
