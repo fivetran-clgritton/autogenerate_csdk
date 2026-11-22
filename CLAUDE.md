@@ -131,7 +131,7 @@ These are **general connectors** for customers running these databases, not harn
 4. **Choose a sync strategy per table.**
    - **Incremental:** when a usable cursor column exists (configurable, defaulting to a convention such as `updated_at`). Read `cursor >= last value` with keyset paging on `(cursor, primary key)`.
    - **Full reload:** for tables with no usable cursor. Use `op.truncate(table, deferred=True)` and then upsert every row, so a failed sync deletes nothing.
-5. **Avoid unbounded reads of large tables.** This is a guideline, not a hard rule. A single unbounded `SELECT *` over tens or hundreds of millions of rows is usually a bad pattern, so prefer bounded batches (`TOP n` / `LIMIT n` / `FETCH FIRST n`) continuing after the last `(cursor, pk)` delivered. Decide per database: some drivers stream a single query well with server-side cursors, others buffer client-side. Check memory with a full sync of the 10M-row orders table. Example: the IRIS driver grew memory linearly (2.4 GB after 6M rows) on one streamed query and would have hit the 4 GB limit that `fivetran debug` and production enforce, so IRIS uses batches.
+5. **Avoid unbounded reads of large tables.** This is a guideline, not a hard rule. A single unbounded `SELECT *` over tens or hundreds of millions of rows is usually a bad pattern, so prefer bounded batches (`TOP n` / `LIMIT n` / `FETCH FIRST n`) continuing after the last `(cursor, pk)` delivered. Decide per database: some drivers stream a single query well with server-side cursors, others buffer client-side. Check memory with a full sync of the 10M-row orders table in the stress-test stage, which comes last (see **Test order**). Example: the IRIS driver grew memory linearly (2.4 GB after 6M rows) on one streamed query and would have hit the 4 GB limit that `fivetran debug` and production enforce, so IRIS uses batches.
    - **Server-side cursors are a good pattern where the database supports them.** The reference is the Redshift `large_data_volume` connector in `fivetran/community_connectors` (`redshift/large_data_volume/redshift_client.py`): `BEGIN`, `DECLARE <name> NO SCROLL CURSOR FOR <query>`, a loop of `FETCH <n> FROM <name>`, then `CLOSE` and `COMMIT`. The database holds the result set, the client holds one batch, and there is no repeated per-batch sort. Where a driver exposes the equivalent natively (a server-side result-set handle, a JDBC fetch size, lazy query execution), that counts too, but verify it with a memory check.
    - For very large incremental tables, the same connector **chunks** the cursor. It finds an upper bound with `ORDER BY rk LIMIT 1 OFFSET chunk_size-1`, declares a cursor over `rk > bookmark AND rk <= upper_bound`, and checkpoints `upper_bound` after each chunk. The `<=` keeps all rows with the boundary value in one chunk, so ties are safe and each transaction stays bounded. (Its extra row-count checkpoints inside a chunk use the last row's value with `>`, which can skip ties on resume. Don't copy that part.)
    - The same connector is also the reference for discovery: `information_schema` tables, columns and primary keys, replication-key inference from column types, include/exclude projection, full-resync fallback, and parallel tables through a connection pool.
@@ -140,7 +140,7 @@ These are **general connectors** for customers running these databases, not harn
 7. **Handle schema drift:** pick up new columns and cope with dropped ones without failing the sync. Declare column types only where a type must be forced (e.g. `DECIMAL` precision/scale, `UTC_DATETIME`), so the SDK can infer the rest and evolve the schema.
 8. **Follow the SDK reference** in the `fivetran-connector-sdk` Claude Code plugin (https://github.com/fivetran/connector_sdk_tools, installed on the VM). In particular: call `op.*` directly (never `yield`), run `/evaluate-connector` before calling a connector done, and keep dependencies the Fivetran runtime lacks (Java/JDBC jars, native client libraries) in mind. Those need the SDK's custom-driver mechanism (`drivers/installation.sh`, Private Preview) or a pure-Python driver.
 
-**Current state (2026-11-22):** IRIS meets requirements 1-7 and is the template (see **Porting the IRIS template**). It passed edge-case tests (string/composite keys, keyless table skipped, every column type, NULL cursors, add/drop column, update, delete, strategy change, resume from a saved position, multi-batch paging with tied cursor values) and a full initial sync of 1M customers + 10M orders (29 min, peak 1.99 GB, `--naming SOURCE`) with a content comparison against the source: counts, distinct ids, column sums, min/max timestamps, per-status counts and a 2,000-row field-by-field sample per table. The 12 test scenarios have not been run yet. The other connectors are still hardcoded to `customers` / `orders` with `id` / `updated_at` (Geode reads regions from config and samples one entry).
+**Current state (2026-11-22):** IRIS meets requirements 1-7 and is the template (see **Porting the IRIS template**). It passed edge-case tests (string/composite keys, keyless table skipped, every column type, NULL cursors, add/drop column, update, delete, strategy change, resume from a saved position, multi-batch paging with tied cursor values) and a full initial sync of 1M customers + 10M orders (29 min, peak 1.99 GB, `--naming SOURCE`) with a content comparison against the source: counts, distinct ids, column sums, min/max timestamps, per-status counts and a 2,000-row field-by-field sample per table. The 12 test scenarios have not been run yet (they now come before stress testing; see **Test order**). The other connectors are still hardcoded to `customers` / `orders` with `id` / `updated_at` (Geode reads regions from config and samples one entry).
 
 ## Porting the IRIS template
 
@@ -153,7 +153,7 @@ These are **general connectors** for customers running these databases, not harn
 5. **Tables without a primary key** are skipped (requirement 3), so every keyset is (cursor, primary key) or the primary key alone; no row-id paging is needed.
 6. **Keep unchanged**: config keys (`schemas`, `include_tables`, `exclude_tables`, `cursor_columns`, `cursor_overrides`), state layout (`{"tables": {"<schema>.<table>": {"mode", "cursor_column", "cursor", "after", "columns"}}}`), `schema=` on every operation, checkpoint cadence (60 s or row cap), deferred truncate for full reloads (not re-issued on resume), NULL-cursor re-send, strategy-change reset, drift warnings.
 
-Test with the same steps IRIS used: small edge-case tables in a separate schema (string PK, composite PK, no PK (must be skipped with a warning), nullable cursor with NULLs, every column type), a second sync after add/drop column + update + delete, a `cursor_overrides` strategy change, a resume from a hand-written `after` position, then the full sync of the seeded tables with a content comparison. Run `/evaluate-connector`.
+Test with the same steps IRIS used: small edge-case tables in a separate schema (string PK, composite PK, no PK (must be skipped with a warning), nullable cursor with NULLs, every column type), a second sync after add/drop column + update + delete, a `cursor_overrides` strategy change, a resume from a hand-written `after` position. Then run the 12 test scenarios on the small fixture (see **Test Scenarios**), run `/evaluate-connector`, and only then the stress test (see **Test order**).
 
 ## Parallel work (one agent per database)
 
@@ -175,7 +175,7 @@ Rules:
 
 - **Own one database.** Only touch your connector directory and your database. Test tables go in a schema of your own (e.g. `FTTest`). Do not reseed or change the seeded `customers` / `orders`.
 - **Never run `seed_all.sh`** while other agents are working: it resets the main checkout and reloads data under other agents' tests. Ask the user.
-- **One full 11M-row sync at a time, VM-wide.** Run it under the shared lock so agents queue instead of overlapping: `flock /home/CLAbeel/.full-sync.lock fivetran debug ...` (it waits until the previous holder finishes). Also check `free -g` first and do not start with less than 8 GB available. Small edge-case runs need no lock.
+- **The lock is for stress tests only.** A full 11M-row sync runs under the shared lock so agents queue instead of overlapping: `flock /home/CLAbeel/.full-sync.lock fivetran debug ...` (it waits until the previous holder finishes). Check `free -g` first and do not start with less than 8 GB available. Edge-case tests and the 12 scenarios use small tables (seconds per sync, well under 300 MB) and run without the lock, in parallel across databases.
 - **Run `fivetran debug` from your worktree** (or a scratch copy) so the `files/warehouse.db` output is yours. Keep config/state files with passwords in your session scratchpad, never in the repo.
 - **Record results in `<db>/NOTES.md`**, not in this file: what was tested, numbers, quirks found. CLAUDE.md is merged once at the end.
 - **Commit and push your branch**; the user opens the PRs.
@@ -188,9 +188,10 @@ If you were started in `~/wt-<db>` and asked to "do your porting task", this is 
 2. Explore your database's catalog and driver behaviour with small queries (types returned for every column type, ordering quirks, how keyset comparisons behave on string keys).
 3. Rewrite `<db>/connector.py`, `configuration.json` (placeholders only) and `requirements.txt` (pinned versions) from the IRIS template.
 4. Test like IRIS: edge-case tables in your own test schema (string PK, composite PK, a table without a PK that must be skipped with a warning, nullable cursor with NULLs, every column type the database has); a second sync after add/drop column + update + delete; a `cursor_overrides` strategy change; a resume from a hand-written `after` position; a multi-batch run with a scratch copy set to `BATCH_SIZE = 2` and tied cursor values.
-5. Full sync of the seeded `customers` / `orders` under the lock (see **Parallel work**) with `--naming SOURCE` and `PYTHONUNBUFFERED=1`, then a content comparison against the source: counts, distinct ids, sums, min/max timestamps, per-status counts, a 2,000-row field-by-field sample per table.
-6. Run `/evaluate-connector` and fix required issues.
-7. Write `<db>/NOTES.md` (what was tested, timings and peak memory, quirks, open questions), commit, push `<db>-general`, and tell the user what is left.
+5. Run the 12 test scenarios on the small fixture in your test schema (see **Test Scenarios**). No lock needed.
+6. Run `/evaluate-connector` and fix required issues; re-run the scenarios after any fix.
+7. Write `<db>/NOTES.md` (what was tested, per-scenario results, quirks, open questions), commit, push `<db>-general`, and tell the user what is left.
+8. **Stress test, last, and only once all 12 scenarios pass:** full sync of the seeded `customers` / `orders` under the lock (see **Parallel work**) with `--naming SOURCE` and `PYTHONUNBUFFERED=1`, then a content comparison against the source: counts, distinct ids, sums, min/max timestamps, per-status counts, a 2,000-row field-by-field sample per table. Add timings and peak memory to `NOTES.md`, commit and push.
 
 Stop and ask the user before anything outside your database: reseeding, container restarts, compose changes, firewall changes.
 
@@ -236,9 +237,24 @@ Running `fivetran debug` on the VM:
   - Geode: OQL has no `OFFSET` and the dev REST API's `bind-values` does not work, so the connector pages by keyset on `updated_at` and validates the cursor before putting it in the query. The old key-scan fallback used a wrong URL and silently returned zero rows, so it was removed (failures now surface).
 - All connectors read with `updated_at >= cursor` (not `>`): rows sharing the cursor timestamp are never skipped on resume or with concurrent writes, and primary-key upserts make the re-read harmless.
 
+## Test order
+
+Decided 2026-11-22: **prove correctness on small data first, stress-test last.**
+
+1. Edge-case tests (see **Porting the IRIS template**).
+2. The 12 test scenarios below, on a small fixture. Each sync takes seconds, so the whole set can be re-run after every connector change, and databases run in parallel without the lock.
+3. Stress test: the full 1M + 10M-row sync of the seeded tables under the lock, with peak memory and a content comparison. Only after all 12 scenarios pass.
+
+Exasol, Mimer, CUBRID and H2 already ran the stress test (before this order was set); their next step is the scenarios.
+
 ## Test Scenarios
 
-12 scenarios in `test_scenarios.sql` (this repo):
+The 12 scenarios are listed in `test_scenarios.sql` (this repo). That file is written at full size against the seeded `orders`: **do not run it against the seeded tables.** Run the scaled-down versions below against a fixture in your own test schema.
+
+**Fixture:** in your test schema, `customers` = seeded rows with `id <= 1000` and `orders` = seeded rows with `id <= 10000` (`CREATE TABLE ... AS SELECT`, then a primary key on `id`). The seeded tables are only read. The fixture is identical in every database, so expected results are the same everywhere. Recreate it before each full run of the scenarios. Point the connector at it with `schemas` set to your test schema and `include_tables` set to `customers,orders`.
+
+**Check after every scenario:** compare the whole destination with the source (the fixture is small enough for a full field-by-field comparison): row counts, no duplicate primary keys, every column of every row equal, except where the scenario expects a difference.
+
 1. Initial sync baseline
 2. Incremental — new rows
 3. Incremental — updates
@@ -251,6 +267,25 @@ Running `fivetran debug` on the VM:
 10. Large payload rows
 11. Cursor boundary fence-post
 12. Concurrent writes during sync
+
+Scaled-down versions (sync = `fivetran debug` re-using the saved state, unless noted):
+
+| # | Change on the fixture | Expected |
+|---|---|---|
+| 1 | Initial sync from empty state | 1,000 + 10,000 rows, every field equal |
+| 2 | Insert 500 orders (ids 10001-10500) with `updated_at` after the saved cursor | All 500 arrive; only those plus the boundary rows (`>=`) are re-read |
+| 3 | Update `amount` on 100 orders and bump `updated_at` | New values in the destination; count unchanged |
+| 4 | Set `status = 'cancelled'` on 50 orders and bump `updated_at` | Status updated in the destination |
+| 5 | Hard-delete 10 orders | Still in the destination (cursor-based sync can't see deletes). Record as a known gap, not a failure |
+| 6 | Outage: sync with the port pointed at a closed port, then insert 200 orders, then sync normally | First sync fails with a clear error and leaves state unchanged; the second picks up all 200, no duplicates. No container stops |
+| 7 | Mid-sync failure: from empty state, run a scratch copy with a small checkpoint row cap (e.g. 1,000) that raises after a few checkpoints; then resume with the real connector | Resume completes; destination equals source, no duplicates |
+| 8 | Add a nullable `discount_pct DECIMAL(5,2)`, set it on 100 orders and bump their `updated_at` | Column appears; values on those rows, NULL elsewhere |
+| 9 | Add a `notes VARCHAR` column, sync, then drop it and sync | No failure; drift warning logged |
+| 10 | Add a large text column and insert 5 orders with ~1 MB values | Values arrive intact (compare length and hash) |
+| 11 | Insert 20 orders with `updated_at` exactly equal to the saved cursor value | All 20 arrive on the next sync |
+| 12 | Concurrent writes: run a scratch copy with a small batch size and a short sleep per batch, and insert/update rows from a second connection while it runs; then sync again | After the follow-up sync the destination equals the source |
+
+Record a pass/fail row per scenario in `<db>/NOTES.md`, with counts and anything the connector does by design.
 
 ## Infrastructure Reference
 
@@ -289,8 +324,8 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 ## Next Steps
 
 1. Port the IRIS template to Exasol, Mimer, CUBRID and H2 (one agent per database, see **Parallel work**), then Geode.
-2. Full initial sync per connector (one at a time; the 10M-row orders table is where memory/speed problems will show), with a content comparison against the source, not just counts
-3. Run the 12 test scenarios against each connector (7, 11 and 12 exercise the `>=` cursor change)
+2. Run the 12 test scenarios against each connector on the small fixture (see **Test Scenarios**; 7, 11 and 12 exercise the `>=` cursor change). No lock; databases in parallel.
+3. Stress test last, once the scenarios pass: full initial sync per connector (one at a time, under the lock; the 10M-row orders table is where memory/speed problems will show), with a content comparison against the source, not just counts. Exasol, Mimer, CUBRID and H2 have already done this.
 4. Get Vertica running (Docker Hub login), then port its connector to the current SDK API (it uses the same nonexistent APIs the others did)
 5. Move credentials out of the repo and rotate them
 6. `fivetran deploy` to a Fivetran workspace for end-to-end testing
