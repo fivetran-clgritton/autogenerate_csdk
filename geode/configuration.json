@@ -1,6 +1,15 @@
 {
-  "host": "GEODE_HOST_IP",
+  "host": "<GEODE_HOST>",
   "rest_port": "8081",
-  "locator_port": "10334",
-  "regions": "customers,orders"
+  "use_https": "false",
+  "validate_certificate": "true",
+  "username": "",
+  "password": "",
+  "include_tables": "",
+  "exclude_tables": "",
+  "cursor_columns": "updated_at",
+  "cursor_overrides": "",
+  "key_column": "_key",
+  "sample_size": "1000",
+  "detect_timestamps": "true"
 }

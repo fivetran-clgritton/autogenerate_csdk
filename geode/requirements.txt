@@ -1,2 +1,1 @@
-requests>=2.31.0
-fivetran-connector-sdk>=1.0.0
+# No dependencies: requests and fivetran_connector_sdk are pre-installed in the Fivetran runtime.
