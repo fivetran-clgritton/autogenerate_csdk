@@ -225,3 +225,11 @@ __marimo__/
 # fivetran debug output
 files/
 crash-reports/
+# Claude Code worktree metadata
+.claude/
+
+# Connector credentials (never commit real keys)
+connectors/**/configuration.json
+
+# fivetran debug output
+connectors/**/files/
