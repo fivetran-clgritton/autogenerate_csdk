@@ -1,8 +1,12 @@
 {
-  "host": "<VM_STATIC_IP>",
+  "host": "<EXASOL_HOST>",
   "port": "8563",
-  "username": "sys",
+  "username": "<EXASOL_USER>",
   "password": "<EXASOL_PASSWORD>",
-  "schema": "testdb",
-  "validate_certificate": "false"
+  "validate_certificate": "true",
+  "schemas": "",
+  "include_tables": "",
+  "exclude_tables": "",
+  "cursor_columns": "updated_at",
+  "cursor_overrides": ""
 }
