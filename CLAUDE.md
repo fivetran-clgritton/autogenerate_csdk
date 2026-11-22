@@ -159,7 +159,7 @@ Test with the same steps IRIS used: small edge-case tables in a separate schema 
 
 After IRIS, each remaining connector is ported by its own Claude session in its own git worktree (`~/wt-<db>`, i.e. `/home/CLAbeel/wt-<db>`, branch `<db>-general`; `/opt/sdk-test-dbs` is root-owned).
 
-**Starting the agents:** `bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh exasol mimer cubrid h2` (any subset; `geode` once one SQL port is done). It creates missing worktrees, fast-forwards untouched ones to `origin/main`, and starts each agent in a tmux session named after the database with the prompt "Do your porting task" (see **Porting tasks** below). Attach with `tmux attach -t <db>`; list with `tmux ls`. Re-running it skips sessions that already exist.
+**Starting the agents:** `bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh exasol mimer cubrid h2` (any subset of `exasol mimer cubrid h2 geode iris`; `iris` runs the scenarios only). It creates missing worktrees, fast-forwards untouched ones to `origin/main`, and starts each agent in a tmux session named after the database with the prompt "Do your porting task" (see **Porting tasks** below). Attach with `tmux attach -t <db>`; list with `tmux ls`. Re-running it skips sessions that already exist.
 
 **Operator steps (for the user):**
 
@@ -195,8 +195,16 @@ If you were started in `~/wt-<db>` and asked to "do your porting task", this is 
 
 Stop and ask the user before anything outside your database: reseeding, container restarts, compose changes, firewall changes.
 
+**IRIS (`~/wt-iris`, branch `iris-general`) is already ported.** It passed the edge-case tests and the stress test (see **Current state** under Connector Requirements), so its task is steps 5-7 only:
+
+- Write `iris/scenarios.py` for the 12 scenarios (copy the structure of `exasol/scenarios.py`, `mimer/scenarios.py`, `cubrid/scenarios.py` or `h2/scenarios.py`) and run it on a small fixture in the `FTTest` schema (it already holds the edge-case tables `typesdemo`, `compositepk`, `nopk`; leave or reuse them).
+- If a scenario finds a connector bug, fix `iris/connector.py` (it is the template, so note the fix in `NOTES.md` for the ports to pick up), re-run all 12 and `/evaluate-connector`.
+- Create `iris/NOTES.md` with the scenario results, plus the edge-case and stress-test results now kept only in this file.
+- Commit and push `iris-general`. Skip step 8 unless a fix could change memory use or speed; then re-run the stress test under the lock.
+
 | DB | Notes |
 |----|-------|
+| iris | Scenarios only (see above). Port 1972, user `_SYSTEM`; the password contains `@`, so build the SQLAlchemy URL with `URL.create`. Selecting a column while ordering by it can return an internal sort-encoded value (the connector casts; a scenario script reading IRIS directly should too). |
 | exasol | Catalog: `EXA_ALL_TABLES` / `EXA_ALL_COLUMNS` / `EXA_ALL_CONSTRAINT_COLUMNS`. Unquoted names are upper-cased (seeded schema `TESTDB`). pyexasol needs `fetch_mapper=pyexasol.exasol_mapper` and `validate_certificate=false`; port 8563. Compare pyexasol's streamed result handle against `LIMIT` batches on memory and time. |
 | mimer | Catalog: `INFORMATION_SCHEMA`. Needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts` and `libmimerapi.so` on the loader path; `connect(dsn="mimerdb")`. Seeded tables live in the `SEEDDB` databank. No `IF NOT EXISTS`. Use `FETCH FIRST n ROWS ONLY`; try mimerpy's server cursor. The native client library needs the SDK's custom-driver mechanism to deploy; note what that would take. |
 | cubrid | Catalog: `db_class` / `db_attribute` / `db_index`. JDBC via jaydebeapi with `/opt/sdk-test-dbs/jars/cubrid_jdbc.jar` and `PYTHONPATH=~/connector-deps`. Use `LIMIT`; test the JDBC fetch size for streaming. Java is needed in production (custom drivers). Open question from earlier: one run reported 9,548 upserts instead of 9,989. |
@@ -319,14 +327,13 @@ https://claude.ai/artifact/GhkQhLXsQFxPXWyd3A4NjR
 - VM state outside the repo: `gh` installed and logged in (OAuth device login, 2026-11-22; can push and open PRs); git identity set in this checkout; JDBC/driver deps for `fivetran debug` in `~/connector-deps` (use `PYTHONPATH=~/connector-deps`); VM compose backup at `/opt/sdk-test-dbs/docker-compose.yml.bak-20261120233821`; Geode PDX persistence configured in its cluster config; Mimer `SEEDDB` databank created; CUBRID `dba` password set.
 - Scratch `fivetran debug` config/state files live in each session's scratchpad and are lost between sessions. Recreate them from the password table above, outside the repo. IRIS state is `{"tables": {"<schema>.<table>": {...}}}` (see the porting guide); the old connectors use Geode `{"<region>": {"last_updated_at": "<ISO ts>"}}`, Exasol `{"<table>": {"updated_at": "..."}}`, the rest `{"<table>_cursor": "..."}`. Mimer also needs `MIMER_SQLHOSTS=/opt/sdk-test-dbs/sqlhosts`.
 - IRIS has a test schema `FTTest` (tables `typesdemo`, `compositepk`, `nopk`) used for the edge-case tests; it is not part of the seeded data.
-- Two GitHub PATs were pasted into an earlier session's transcript. The VM no longer uses a PAT; the user still needs to revoke both on GitHub.
-- Seeded data: the Exasol `customers` / `orders` had no primary keys, so disabled PK constraints (`CUSTOMERS_PK`, `ORDERS_PK`) were added by hand; `seed_data.py` does not create them yet, so a reseed loses them. CUBRID's database charset is iso88591 but some seeded text holds UTF-8 bytes, which reads back garbled (see `cubrid/NOTES.md`).
+- Seeded data: `seed_data.py` creates Exasol's primary keys as disabled constraints (`CUSTOMERS_PK`, `ORDERS_PK`, the same ones that were first added by hand), and adds them to existing tables on a reseed. CUBRID's database charset is iso88591 but some seeded text holds UTF-8 bytes, which reads back garbled (see `cubrid/NOTES.md`).
 
 ## Next Steps
 
-1. Port Geode (`bash /opt/sdk-test-dbs/connectors/start_porting_agents.sh geode`). Exasol, Mimer, CUBRID and H2 are done: edge cases, 12 scenarios and stress test.
-2. Run the 12 scenarios on IRIS (the template has only had edge cases and the stress test). Each ported connector has a `scenarios.py` to copy from.
-3. Fix the seeding gaps above: create Exasol's primary keys in `seed_data.py`; decide what to do about CUBRID's charset.
+1. Port Geode: agent `geode` started 2026-11-22. Exasol, Mimer, CUBRID and H2 are done: edge cases, 12 scenarios and stress test.
+2. Run the 12 scenarios on IRIS: agent `iris` started 2026-11-22 (see the IRIS note under **Porting tasks**).
+3. Decide what to do about CUBRID's charset (see the seeding note above).
 4. Deployment: Mimer needs its native client library and CUBRID/H2 need Java, so all three need the SDK's custom-driver mechanism (Private Preview). Exasol is pure Python.
 5. Get Vertica running (Docker Hub login), then port its connector to the current SDK API (it uses the same nonexistent APIs the others did)
 6. Move credentials out of the repo and rotate them
