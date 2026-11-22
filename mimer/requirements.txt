@@ -1,2 +1,1 @@
-mimerpy
-fivetran-connector-sdk
+mimerpy==1.3.11
