@@ -168,7 +168,16 @@ def seed_exasol(host, password):
                 id INT, customer_id INT, amount DECIMAL(10,2),
                 status VARCHAR(20), created_at TIMESTAMP, updated_at TIMESTAMP
             )""")
-        # No primary keys here, so a re-run would append duplicates without this
+        # Primary keys as DISABLE constraints: catalog metadata the connector reads, not checked on
+        # load (the usual Exasol pattern). Added separately so tables from older runs get them too.
+        for table in ("customers", "orders"):
+            exists = conn.execute(
+                "SELECT COUNT(*) FROM EXA_ALL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = CURRENT_SCHEMA"
+                " AND CONSTRAINT_TABLE = {t} AND CONSTRAINT_TYPE = 'PRIMARY KEY'",
+                {"t": table.upper()}).fetchval()
+            if not exists:
+                conn.execute(f"ALTER TABLE {table} ADD CONSTRAINT {table}_pk PRIMARY KEY (id) DISABLE")
+        # Constraints are disabled, so a re-run would append duplicates without this
         conn.execute("TRUNCATE TABLE customers")
         conn.execute("TRUNCATE TABLE orders")
         conn.import_from_iterable(customer_rows(CUST_COUNT), "customers")

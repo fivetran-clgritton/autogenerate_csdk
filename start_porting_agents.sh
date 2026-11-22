@@ -14,7 +14,7 @@ set -euo pipefail
 
 REPO=/opt/sdk-test-dbs/connectors
 BASE=${BASE:-main}
-KNOWN="exasol mimer cubrid h2 geode"
+KNOWN="exasol mimer cubrid h2 geode iris"   # iris: scenarios only (see CLAUDE.md)
 PROMPT="Do your porting task: read the 'Porting tasks' section of CLAUDE.md and follow it for the database this worktree is for."
 
 if [ $# -eq 0 ]; then
